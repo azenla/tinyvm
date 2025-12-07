@@ -54,8 +54,8 @@ impl RegisterBank {
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
-pub struct Machine {
-    program: Program,
+pub struct Machine<'program> {
+    program: &'program Program,
     stack: Vec<MachineValue>,
     calls: Vec<MachineValue>,
     bank: RegisterBank,
@@ -68,8 +68,8 @@ pub enum MachineLoopState {
     Break,
 }
 
-impl Machine {
-    pub fn new(program: Program) -> Self {
+impl<'program> Machine<'program> {
+    pub fn new(program: &'program Program) -> Machine<'program> {
         Self {
             program,
             stack: Vec::new(),
@@ -104,7 +104,7 @@ impl Machine {
     }
 
     pub fn step(&mut self) -> Result<MachineLoopState> {
-        let op = *self
+        let op = self
             .program
             .ops()
             .get(self.current)
@@ -138,20 +138,20 @@ impl Machine {
                 let value1 = self.pop()?;
                 let value2 = self.pop()?;
                 if value1 == value2 {
-                    self.jmp(&op)?;
+                    self.jmp(op)?;
                     return Ok(MachineLoopState::Continue);
                 }
             }
 
             OpCode::Jump => {
-                self.jmp(&op)?;
+                self.jmp(op)?;
                 return Ok(MachineLoopState::Continue);
             }
 
             OpCode::JumpIfZero => {
                 let value = self.stack.pop().ok_or(MachineError::StackEmpty)?;
                 if value.as_u64() == 0 {
-                    self.jmp(&op)?;
+                    self.jmp(op)?;
                     return Ok(MachineLoopState::Continue);
                 }
             }
@@ -161,7 +161,7 @@ impl Machine {
             }
 
             OpCode::Call => {
-                self.call(&op)?;
+                self.call(op)?;
                 return Ok(MachineLoopState::Continue);
             }
 

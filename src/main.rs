@@ -8,7 +8,7 @@ pub mod fib;
 const COUNT: usize = 1_000_000;
 
 fn main() -> Result<()> {
-    let mut machine = Machine::new(fib::fib());
+    let mut machine = Machine::new(&fib::FIB);
 
     let time = Instant::now();
     for _ in 0..COUNT {
