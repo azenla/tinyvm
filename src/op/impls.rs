@@ -32,6 +32,7 @@ impl OpArg {
         size_of::<u8>() + size_of::<u64>()
     }
 
+    #[inline(always)]
     pub fn id(&self) -> u8 {
         match self {
             OpArg::Register1 => 0,
