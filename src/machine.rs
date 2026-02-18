@@ -19,7 +19,6 @@ impl RegisterBank {
         self.registers = [MachineValue::None; 9];
     }
 
-    #[inline]
     pub fn load(&self, arg: OpArg) -> Option<MachineValue> {
         match arg {
             OpArg::Register1 => Some(self.registers[0]),
@@ -35,7 +34,6 @@ impl RegisterBank {
         }
     }
 
-    #[inline]
     pub fn store(&mut self, arg: OpArg, value: MachineValue) -> Result<()> {
         match arg {
             OpArg::Register1 => self.registers[0] = value,
