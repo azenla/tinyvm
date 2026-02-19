@@ -5,9 +5,11 @@ use crate::program::Program;
 
 pub mod value;
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
+const REGISTER_BANK_COUNT: usize = 9;
+
+#[derive(PartialEq, Clone, Copy, Debug, Default)]
 pub struct RegisterBank {
-    registers: [MachineValue; 9],
+    registers: [MachineValue; REGISTER_BANK_COUNT],
 }
 
 impl RegisterBank {
@@ -16,7 +18,7 @@ impl RegisterBank {
     }
 
     pub fn reset(&mut self) {
-        self.registers = [MachineValue::None; 9];
+        self.registers = [MachineValue::None; REGISTER_BANK_COUNT];
     }
 
     pub fn load(&self, arg: OpArg) -> Option<MachineValue> {
@@ -51,9 +53,9 @@ impl RegisterBank {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(PartialEq, Clone, Debug)]
 pub struct Machine<'program> {
-    program: &'program Program,
+    program: &'program Program<'program>,
     stack: Vec<MachineValue>,
     calls: Vec<MachineValue>,
     bank: RegisterBank,
@@ -119,16 +121,38 @@ impl<'program> Machine<'program> {
                 self.bank.store(op.arg, value)?;
             }
 
-            OpCode::Add | OpCode::Subtract | OpCode::Multiply | OpCode::Divide => {
+            OpCode::Add => {
                 let value1 = self.pop()?;
                 let value2 = self.pop()?;
-                let result = match op.code {
-                    OpCode::Add => value2 + value1,
-                    OpCode::Subtract => value2 - value1,
-                    OpCode::Multiply => value2 * value1,
-                    OpCode::Divide => value2 / value1,
-                    _ => unreachable!("operation invalid"),
-                };
+                let result = value2 + value1;
+                self.stack.push(result);
+            }
+
+            OpCode::Subtract => {
+                let value1 = self.pop()?;
+                let value2 = self.pop()?;
+                let result = value2 - value1;
+                self.stack.push(result);
+            }
+
+            OpCode::Multiply => {
+                let value1 = self.pop()?;
+                let value2 = self.pop()?;
+                let result = value2 * value1;
+                self.stack.push(result);
+            }
+
+            OpCode::Divide => {
+                let value1 = self.pop()?;
+                let value2 = self.pop()?;
+                let result = value2 / value1;
+                self.stack.push(result);
+            }
+
+            OpCode::Remainder => {
+                let value1 = self.pop()?;
+                let value2 = self.pop()?;
+                let result = value2 % value1;
                 self.stack.push(result);
             }
 

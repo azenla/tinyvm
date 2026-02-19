@@ -1,21 +1,30 @@
 use crate::op::Op;
+use std::borrow::Cow;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Program {
-    Owned(Vec<Op>),
-    Static(&'static [Op]),
+pub struct Program<'ops> {
+    ops: Cow<'ops, [Op]>,
 }
 
-impl Program {
-    pub fn new(ops: Vec<Op>) -> Self {
-        Self::Owned(ops)
+impl<'ops> Program<'ops> {
+    pub const fn new_owned(ops: Vec<Op>) -> Self {
+        Self {
+            ops: Cow::Owned(ops),
+        }
+    }
+
+    pub const fn new_borrowed(ops: &'ops [Op]) -> Program<'ops> {
+        Self {
+            ops: Cow::Borrowed(ops),
+        }
+    }
+
+    pub const fn from_cow(ops: Cow<'ops, [Op]>) -> Self {
+        Self { ops }
     }
 
     pub fn ops(&self) -> &[Op] {
-        match self {
-            Self::Owned(ops) => ops,
-            Self::Static(ops) => ops,
-        }
+        &self.ops
     }
 
     pub fn decode(buffer: &[u8]) -> Option<Self> {
@@ -26,7 +35,7 @@ impl Program {
             )?;
             ops.push(op);
         }
-        Some(Self::Owned(ops))
+        Some(Self::new_owned(ops))
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -36,18 +45,22 @@ impl Program {
         }
         buffer
     }
-}
 
-#[macro_export]
-macro_rules! program_static {
-    ($($op:expr),+ $(,)?) => {
-        $crate::program::Program::Static(&[$($op),+])
+    pub fn into_cow(self) -> Cow<'ops, [Op]> {
+        self.ops
     }
 }
 
 #[macro_export]
-macro_rules! program{
+macro_rules! program {
     ($($op:expr),+ $(,)?) => {
-        $crate::program::Program::new(vec![$($op),+])
+       $crate::program::Program::new_borrowed(&[$($op),+])
+    }
+}
+
+#[macro_export]
+macro_rules! program_owned {
+    ($($op:expr),+ $(,)?) => {
+        $crate::program::Program:neww(vec![$($op),+])
     }
 }

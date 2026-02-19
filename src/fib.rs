@@ -1,9 +1,9 @@
 use tinyvm::op::OpArg::{Instruction, Register1, Register2, Register3, Register4, Uint64};
 use tinyvm::op::OpCode::{Add, Exit, Jump, JumpIfZero, Pop, Push, Subtract};
 use tinyvm::program::Program;
-use tinyvm::{op, program_static};
+use tinyvm::{op, program};
 
-pub static FIB: Program = program_static!(
+pub static FIB: Program = program!(
     // Pop the input value into r3.
     op!(Pop, Register3),
     // fib(0) = 0: store in r1.

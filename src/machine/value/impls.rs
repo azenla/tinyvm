@@ -1,7 +1,7 @@
 use crate::machine::RegisterBank;
 use crate::machine::value::MachineValue;
 use crate::op::OpArg;
-use std::ops::{Add, Div, Mul, Sub};
+use std::ops::{Add, Div, Mul, Rem, Sub};
 
 impl MachineValue {
     pub fn of(arg: OpArg, bank: &RegisterBank) -> Option<Self> {
@@ -20,13 +20,12 @@ impl MachineValue {
             OpArg::Uint64(value) => Some(MachineValue::Uint64(value)),
             OpArg::Int32(value) => Some(MachineValue::Int32(value)),
             OpArg::Int64(value) => Some(MachineValue::Int64(value)),
-
-            OpArg::None => Some(MachineValue::None),
             OpArg::Uint8(value) => Some(MachineValue::Uint8(value)),
             OpArg::Uint16(value) => Some(MachineValue::Uint16(value)),
             OpArg::Int8(value) => Some(MachineValue::Int8(value)),
             OpArg::Int16(value) => Some(MachineValue::Int16(value)),
             OpArg::Instruction(_) => None,
+            OpArg::None => Some(MachineValue::None),
         }
     }
 
@@ -229,6 +228,14 @@ impl Div for MachineValue {
     }
 }
 
+impl Rem for MachineValue {
+    type Output = Self;
+
+    fn rem(self, rhs: Self) -> Self::Output {
+        perform_value_op!(self, rhs, %)
+    }
+}
+
 impl PartialEq for MachineValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -258,5 +265,3 @@ impl PartialEq for MachineValue {
         }
     }
 }
-
-impl Eq for MachineValue {}
