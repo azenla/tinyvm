@@ -3,6 +3,23 @@ use crate::machine::value::MachineValue;
 use crate::op::OpArg;
 use std::ops::{Add, Div, Mul, Rem, Sub};
 
+macro_rules! perform_numeric_op {
+    ($input:expr, |$value:ident| $perform:expr, $none:expr) => {
+        match $input {
+            MachineValue::Uint32($value) => $perform,
+            MachineValue::Int32($value) => $perform,
+            MachineValue::Int64($value) => $perform,
+            MachineValue::Uint8($value) => $perform,
+            MachineValue::Uint16($value) => $perform,
+            MachineValue::Uint64($value) => $perform,
+            MachineValue::Int8($value) => $perform,
+            MachineValue::Int16($value) => $perform,
+            MachineValue::ReturnAddress($value) => $perform,
+            MachineValue::None => $none,
+        }
+    };
+}
+
 impl MachineValue {
     pub fn of(arg: OpArg, bank: &RegisterBank) -> Option<Self> {
         match arg {
@@ -156,9 +173,45 @@ impl MachineValue {
             MachineValue::ReturnAddress(value) => value as i64,
         }
     }
+
+    pub fn is_zero(self) -> bool {
+        perform_numeric_op!(self, |value| value == 0, true)
+    }
+
+    pub fn leading_zeros(self) -> MachineValue {
+        perform_numeric_op!(
+            self,
+            |value| MachineValue::Uint32(value.leading_zeros()),
+            MachineValue::None
+        )
+    }
+
+    pub fn leading_ones(self) -> MachineValue {
+        perform_numeric_op!(
+            self,
+            |value| MachineValue::Uint32(value.leading_ones()),
+            MachineValue::None
+        )
+    }
+
+    pub fn trailing_zeros(self) -> MachineValue {
+        perform_numeric_op!(
+            self,
+            |value| MachineValue::Uint32(value.trailing_zeros()),
+            MachineValue::None
+        )
+    }
+
+    pub fn trailing_ones(self) -> MachineValue {
+        perform_numeric_op!(
+            self,
+            |value| MachineValue::Uint32(value.trailing_ones()),
+            MachineValue::None
+        )
+    }
 }
 
-macro_rules! perform_value_op {
+macro_rules! perform_infix_op {
     ($left:expr, $right:expr, $op:tt) => {
         match ($left, $right) {
             (MachineValue::Uint32(lhs), MachineValue::Uint32(rhs)) => {
@@ -200,7 +253,7 @@ impl Add for MachineValue {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        perform_value_op!(self, rhs, +)
+        perform_infix_op!(self, rhs, +)
     }
 }
 
@@ -208,7 +261,7 @@ impl Sub for MachineValue {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        perform_value_op!(self, rhs, -)
+        perform_infix_op!(self, rhs, -)
     }
 }
 
@@ -216,7 +269,7 @@ impl Mul for MachineValue {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        perform_value_op!(self, rhs, *)
+        perform_infix_op!(self, rhs, *)
     }
 }
 
@@ -224,7 +277,7 @@ impl Div for MachineValue {
     type Output = Self;
 
     fn div(self, rhs: Self) -> Self::Output {
-        perform_value_op!(self, rhs, /)
+        perform_infix_op!(self, rhs, /)
     }
 }
 
@@ -232,7 +285,7 @@ impl Rem for MachineValue {
     type Output = Self;
 
     fn rem(self, rhs: Self) -> Self::Output {
-        perform_value_op!(self, rhs, %)
+        perform_infix_op!(self, rhs, %)
     }
 }
 

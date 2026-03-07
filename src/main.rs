@@ -1,21 +1,18 @@
-use tinyvm::error::Result;
 use tinyvm::machine::Machine;
+use tinyvm::machine::error::Result;
 use tinyvm::machine::value::MachineValue::Uint64;
 
 pub mod fib;
 
-const COUNT: usize = 100000;
-const INPUT: u64 = 60;
+const INPUT: u64 = 8;
 
 fn main() -> Result<()> {
     let mut machine = Machine::new(&fib::FIB);
 
-    for _ in 0..COUNT {
-        machine.push(Uint64(INPUT));
-        machine.run()?;
-        let _value = machine.pop()?;
-        machine.reset();
-    }
+    machine.push(Uint64(INPUT));
+    machine.run()?;
+    let value = machine.pop()?;
+    println!("fib({INPUT}) = {}", value.as_u64());
 
     Ok(())
 }

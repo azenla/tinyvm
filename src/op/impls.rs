@@ -18,6 +18,12 @@ impl OpCode {
             8 => Some(OpCode::JumpIfZero),
             9 => Some(OpCode::Call),
             10 => Some(OpCode::Return),
+            11 => Some(OpCode::Jump),
+            12 => Some(OpCode::Remainder),
+            13 => Some(OpCode::CountLeadingZeros),
+            14 => Some(OpCode::CountLeadingOnes),
+            15 => Some(OpCode::CountTrailingZeros),
+            16 => Some(OpCode::CountTrailingOnes),
             _ => None,
         }
     }

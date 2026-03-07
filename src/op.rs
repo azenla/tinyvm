@@ -16,6 +16,10 @@ pub enum OpCode {
     Return = 10,
     Jump = 11,
     Remainder = 12,
+    CountLeadingZeros = 13,
+    CountLeadingOnes = 14,
+    CountTrailingZeros = 15,
+    CountTrailingOnes = 16,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
@@ -29,7 +33,7 @@ pub enum OpArg {
     Register6 = 5,
     Register7 = 6,
     Register8 = 7,
-    Register9 = 9,
+    Register9 = 8,
     None = 10,
     Uint8(u8) = 11,
     Uint16(u16) = 12,

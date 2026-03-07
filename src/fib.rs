@@ -35,7 +35,7 @@ pub static FIB: Program = program!(
     // Jump back to the loop start.
     op!(Jump, Instruction(5)),
     // Push the result to the stack.
-    op!(Push, Register2),
+    op!(Push, Register1),
     // Exit.
     op!(Exit)
 );

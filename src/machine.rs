@@ -1,8 +1,17 @@
-use crate::error::{MachineError, Result};
+use crate::machine::error::{MachineError, Result};
+use crate::machine::ops::MachineOp;
+use crate::machine::ops::control::{CallOp, ExitOp, JumpIfEqualOp, JumpIfZeroOp, JumpOp, ReturnOp};
+use crate::machine::ops::math::{
+    AddOp, CountLeadingOnesOp, CountLeadingZerosOp, CountTrailingOnesOp, CountTrailingZerosOp,
+    DivideOp, MultiplyOp, RemainderOp, SubtractOp,
+};
+use crate::machine::ops::stack::{PopOp, PushOp};
 use crate::machine::value::MachineValue;
 use crate::op::{Op, OpArg, OpCode};
 use crate::program::Program;
 
+pub mod error;
+pub mod ops;
 pub mod value;
 
 const REGISTER_BANK_COUNT: usize = 9;
@@ -64,7 +73,8 @@ pub struct Machine<'program> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineLoopState {
-    Continue,
+    Next,
+    Stay,
     Break,
 }
 
@@ -109,95 +119,56 @@ impl<'program> Machine<'program> {
             .ops()
             .get(self.current)
             .ok_or(MachineError::InstructionOverflow)?;
-        match op.code {
-            OpCode::Push => {
-                let value =
-                    MachineValue::of(op.arg, &self.bank).ok_or(MachineError::ValueExpected)?;
-                self.stack.push(value);
-            }
+        let state = match op.code {
+            OpCode::Push => PushOp::perform(self, op)?,
 
-            OpCode::Pop => {
-                let value = self.stack.pop().ok_or(MachineError::StackEmpty)?;
-                self.bank.store(op.arg, value)?;
-            }
+            OpCode::Pop => PopOp::perform(self, op)?,
 
-            OpCode::Add => {
-                let value1 = self.pop()?;
-                let value2 = self.pop()?;
-                let result = value2 + value1;
-                self.stack.push(result);
-            }
+            OpCode::Add => AddOp::perform(self, op)?,
 
-            OpCode::Subtract => {
-                let value1 = self.pop()?;
-                let value2 = self.pop()?;
-                let result = value2 - value1;
-                self.stack.push(result);
-            }
+            OpCode::Subtract => SubtractOp::perform(self, op)?,
 
-            OpCode::Multiply => {
-                let value1 = self.pop()?;
-                let value2 = self.pop()?;
-                let result = value2 * value1;
-                self.stack.push(result);
-            }
+            OpCode::Multiply => MultiplyOp::perform(self, op)?,
 
-            OpCode::Divide => {
-                let value1 = self.pop()?;
-                let value2 = self.pop()?;
-                let result = value2 / value1;
-                self.stack.push(result);
-            }
+            OpCode::Divide => DivideOp::perform(self, op)?,
 
-            OpCode::Remainder => {
-                let value1 = self.pop()?;
-                let value2 = self.pop()?;
-                let result = value2 % value1;
-                self.stack.push(result);
-            }
+            OpCode::Remainder => RemainderOp::perform(self, op)?,
 
-            OpCode::JumpIfEqual => {
-                let value1 = self.pop()?;
-                let value2 = self.pop()?;
-                if value1 == value2 {
-                    self.jmp(op)?;
-                    return Ok(MachineLoopState::Continue);
-                }
-            }
+            OpCode::JumpIfEqual => JumpIfEqualOp::perform(self, op)?,
 
-            OpCode::Jump => {
-                self.jmp(op)?;
-                return Ok(MachineLoopState::Continue);
-            }
+            OpCode::Jump => JumpOp::perform(self, op)?,
 
-            OpCode::JumpIfZero => {
-                let value = self.stack.pop().ok_or(MachineError::StackEmpty)?;
-                if value.as_u64() == 0 {
-                    self.jmp(op)?;
-                    return Ok(MachineLoopState::Continue);
-                }
-            }
+            OpCode::JumpIfZero => JumpIfZeroOp::perform(self, op)?,
 
-            OpCode::Exit => {
-                return Ok(MachineLoopState::Break);
-            }
+            OpCode::Exit => ExitOp::perform(self, op)?,
 
-            OpCode::Call => {
-                self.call(op)?;
-                return Ok(MachineLoopState::Continue);
-            }
+            OpCode::Call => CallOp::perform(self, op)?,
 
-            OpCode::Return => {
-                self.ret()?;
-                return Ok(MachineLoopState::Continue);
-            }
+            OpCode::Return => ReturnOp::perform(self, op)?,
+
+            OpCode::CountLeadingZeros => CountLeadingZerosOp::perform(self, op)?,
+
+            OpCode::CountLeadingOnes => CountLeadingOnesOp::perform(self, op)?,
+
+            OpCode::CountTrailingZeros => CountTrailingZerosOp::perform(self, op)?,
+
+            OpCode::CountTrailingOnes => CountTrailingOnesOp::perform(self, op)?,
+        };
+
+        if state == MachineLoopState::Next {
+            self.current += 1;
         }
-        self.current += 1;
-        Ok(MachineLoopState::Continue)
+
+        Ok(state)
     }
 
     pub fn run(&mut self) -> Result<()> {
-        while let MachineLoopState::Continue = self.step()? {}
+        loop {
+            let state = self.step()?;
+            if state == MachineLoopState::Break {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -220,5 +191,9 @@ impl<'program> Machine<'program> {
 
         self.current = 0;
         self.bank.reset();
+    }
+
+    pub fn bank(&self) -> &RegisterBank {
+        &self.bank
     }
 }

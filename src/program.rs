@@ -61,6 +61,6 @@ macro_rules! program {
 #[macro_export]
 macro_rules! program_owned {
     ($($op:expr),+ $(,)?) => {
-        $crate::program::Program:neww(vec![$($op),+])
+        $crate::program::Program::new_owned(vec![$($op),+])
     }
 }
