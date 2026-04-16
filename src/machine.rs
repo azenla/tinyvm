@@ -1,13 +1,6 @@
 use crate::machine::error::{MachineError, Result};
-use crate::machine::ops::MachineOp;
-use crate::machine::ops::control::{CallOp, ExitOp, JumpIfEqualOp, JumpIfZeroOp, JumpOp, ReturnOp};
-use crate::machine::ops::math::{
-    AddOp, CountLeadingOnesOp, CountLeadingZerosOp, CountTrailingOnesOp, CountTrailingZerosOp,
-    DivideOp, MultiplyOp, RemainderOp, SubtractOp,
-};
-use crate::machine::ops::stack::{PopOp, PushOp};
 use crate::machine::value::MachineValue;
-use crate::op::{Op, OpArg, OpCode};
+use crate::op::{Op, OpArg};
 use crate::program::Program;
 
 pub mod error;
@@ -119,46 +112,10 @@ impl<'program> Machine<'program> {
             .ops()
             .get(self.current)
             .ok_or(MachineError::InstructionOverflow)?;
-        let state = match op.code {
-            OpCode::Push => PushOp::perform(self, op)?,
-
-            OpCode::Pop => PopOp::perform(self, op)?,
-
-            OpCode::Add => AddOp::perform(self, op)?,
-
-            OpCode::Subtract => SubtractOp::perform(self, op)?,
-
-            OpCode::Multiply => MultiplyOp::perform(self, op)?,
-
-            OpCode::Divide => DivideOp::perform(self, op)?,
-
-            OpCode::Remainder => RemainderOp::perform(self, op)?,
-
-            OpCode::JumpIfEqual => JumpIfEqualOp::perform(self, op)?,
-
-            OpCode::Jump => JumpOp::perform(self, op)?,
-
-            OpCode::JumpIfZero => JumpIfZeroOp::perform(self, op)?,
-
-            OpCode::Exit => ExitOp::perform(self, op)?,
-
-            OpCode::Call => CallOp::perform(self, op)?,
-
-            OpCode::Return => ReturnOp::perform(self, op)?,
-
-            OpCode::CountLeadingZeros => CountLeadingZerosOp::perform(self, op)?,
-
-            OpCode::CountLeadingOnes => CountLeadingOnesOp::perform(self, op)?,
-
-            OpCode::CountTrailingZeros => CountTrailingZerosOp::perform(self, op)?,
-
-            OpCode::CountTrailingOnes => CountTrailingOnesOp::perform(self, op)?,
-        };
-
+        let state = ops::perform(self, op)?;
         if state == MachineLoopState::Next {
             self.current += 1;
         }
-
         Ok(state)
     }
 
