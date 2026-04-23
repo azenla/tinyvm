@@ -1,12 +1,16 @@
 use crate::machine::error::Result;
-use crate::machine::ops::MachineOp;
-use crate::machine::{Machine, MachineLoopState};
-use crate::op::Op;
+use crate::machine::ops::OpHandler;
+use crate::machine::{MachineLoopState, MachineState};
+use crate::op::{Op, OpCode};
 
 pub struct AddOp;
 
-impl MachineOp for AddOp {
-    fn perform(machine: &mut Machine, _op: &Op) -> Result<MachineLoopState> {
+impl OpHandler for AddOp {
+    fn code(&self) -> OpCode {
+        OpCode::Add
+    }
+
+    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         let value1 = machine.pop()?;
         let value2 = machine.pop()?;
         let result = value2 + value1;
@@ -17,8 +21,12 @@ impl MachineOp for AddOp {
 
 pub struct SubtractOp;
 
-impl MachineOp for SubtractOp {
-    fn perform(machine: &mut Machine, _op: &Op) -> Result<MachineLoopState> {
+impl OpHandler for SubtractOp {
+    fn code(&self) -> OpCode {
+        OpCode::Subtract
+    }
+
+    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         let value1 = machine.pop()?;
         let value2 = machine.pop()?;
         let result = value2 - value1;
@@ -29,8 +37,12 @@ impl MachineOp for SubtractOp {
 
 pub struct MultiplyOp;
 
-impl MachineOp for MultiplyOp {
-    fn perform(machine: &mut Machine, _op: &Op) -> Result<MachineLoopState> {
+impl OpHandler for MultiplyOp {
+    fn code(&self) -> OpCode {
+        OpCode::Multiply
+    }
+
+    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         let value1 = machine.pop()?;
         let value2 = machine.pop()?;
         let result = value2 * value1;
@@ -41,8 +53,12 @@ impl MachineOp for MultiplyOp {
 
 pub struct DivideOp;
 
-impl MachineOp for DivideOp {
-    fn perform(machine: &mut Machine, _op: &Op) -> Result<MachineLoopState> {
+impl OpHandler for DivideOp {
+    fn code(&self) -> OpCode {
+        OpCode::Divide
+    }
+
+    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         let value1 = machine.pop()?;
         let value2 = machine.pop()?;
         let result = value2 / value1;
@@ -53,8 +69,12 @@ impl MachineOp for DivideOp {
 
 pub struct RemainderOp;
 
-impl MachineOp for RemainderOp {
-    fn perform(machine: &mut Machine, _op: &Op) -> Result<MachineLoopState> {
+impl OpHandler for RemainderOp {
+    fn code(&self) -> OpCode {
+        OpCode::Remainder
+    }
+
+    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         let value1 = machine.pop()?;
         let value2 = machine.pop()?;
         let result = value2 % value1;
@@ -65,8 +85,12 @@ impl MachineOp for RemainderOp {
 
 pub struct CountLeadingZerosOp;
 
-impl MachineOp for CountLeadingZerosOp {
-    fn perform(machine: &mut Machine, _op: &Op) -> Result<MachineLoopState> {
+impl OpHandler for CountLeadingZerosOp {
+    fn code(&self) -> OpCode {
+        OpCode::CountLeadingZeros
+    }
+
+    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         let value = machine.pop()?;
         machine.push(value.leading_zeros());
         Ok(MachineLoopState::Next)
@@ -75,8 +99,12 @@ impl MachineOp for CountLeadingZerosOp {
 
 pub struct CountLeadingOnesOp;
 
-impl MachineOp for CountLeadingOnesOp {
-    fn perform(machine: &mut Machine, _op: &Op) -> Result<MachineLoopState> {
+impl OpHandler for CountLeadingOnesOp {
+    fn code(&self) -> OpCode {
+        OpCode::CountLeadingOnes
+    }
+
+    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         let value = machine.pop()?;
         machine.push(value.leading_ones());
         Ok(MachineLoopState::Next)
@@ -85,8 +113,12 @@ impl MachineOp for CountLeadingOnesOp {
 
 pub struct CountTrailingZerosOp;
 
-impl MachineOp for CountTrailingZerosOp {
-    fn perform(machine: &mut Machine, _op: &Op) -> Result<MachineLoopState> {
+impl OpHandler for CountTrailingZerosOp {
+    fn code(&self) -> OpCode {
+        OpCode::CountTrailingZeros
+    }
+
+    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         let value = machine.pop()?;
         machine.push(value.trailing_zeros());
         Ok(MachineLoopState::Next)
@@ -95,8 +127,12 @@ impl MachineOp for CountTrailingZerosOp {
 
 pub struct CountTrailingOnesOp;
 
-impl MachineOp for CountTrailingOnesOp {
-    fn perform(machine: &mut Machine, _op: &Op) -> Result<MachineLoopState> {
+impl OpHandler for CountTrailingOnesOp {
+    fn code(&self) -> OpCode {
+        OpCode::CountTrailingOnes
+    }
+
+    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         let value = machine.pop()?;
         machine.push(value.trailing_ones());
         Ok(MachineLoopState::Next)

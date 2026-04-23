@@ -11,6 +11,7 @@ pub enum MachineError {
     ValueExpected,
     RegisterExpected,
     CallStackEmpty,
+    InvalidOpCode,
 }
 
 impl Display for MachineError {
@@ -22,6 +23,7 @@ impl Display for MachineError {
             MachineError::ValueExpected => write!(f, "value expected"),
             MachineError::RegisterExpected => write!(f, "register expected"),
             MachineError::CallStackEmpty => write!(f, "call stack empty"),
+            MachineError::InvalidOpCode => write!(f, "invalid opcode"),
         }
     }
 }

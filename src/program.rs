@@ -2,18 +2,18 @@ use crate::op::Op;
 use std::borrow::Cow;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Program<'ops> {
+pub struct RawProgram<'ops> {
     ops: Cow<'ops, [Op]>,
 }
 
-impl<'ops> Program<'ops> {
+impl<'ops> RawProgram<'ops> {
     pub const fn new_owned(ops: Vec<Op>) -> Self {
         Self {
             ops: Cow::Owned(ops),
         }
     }
 
-    pub const fn new_borrowed(ops: &'ops [Op]) -> Program<'ops> {
+    pub const fn new_borrowed(ops: &'ops [Op]) -> RawProgram<'ops> {
         Self {
             ops: Cow::Borrowed(ops),
         }
@@ -54,13 +54,13 @@ impl<'ops> Program<'ops> {
 #[macro_export]
 macro_rules! program {
     ($($op:expr),+ $(,)?) => {
-       $crate::program::Program::new_borrowed(&[$($op),+])
+       $crate::program::RawProgram::new_borrowed(&[$($op),+])
     }
 }
 
 #[macro_export]
 macro_rules! program_owned {
     ($($op:expr),+ $(,)?) => {
-        $crate::program::Program::new_owned(vec![$($op),+])
+        $crate::program::RawProgram::new_owned(vec![$($op),+])
     }
 }
