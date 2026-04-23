@@ -12,3 +12,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "tinyvm"
 path = "src/main.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

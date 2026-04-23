@@ -1,3 +1,4 @@
+use crate::machine::MachineLoopState;
 use crate::machine::error::{MachineError, Result};
 use crate::machine::ops::control::{CallOp, ExitOp, JumpIfEqualOp, JumpIfZeroOp, JumpOp, ReturnOp};
 use crate::machine::ops::math::{
@@ -5,7 +6,7 @@ use crate::machine::ops::math::{
     DivideOp, MultiplyOp, RemainderOp, SubtractOp,
 };
 use crate::machine::ops::stack::{PopOp, PushOp};
-use crate::machine::{MachineLoopState, MachineState};
+use crate::machine::state::MachineState;
 use crate::op::{Op, OpCode};
 use crate::program::RawProgram;
 use std::collections::HashMap;

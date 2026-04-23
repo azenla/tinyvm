@@ -11,13 +11,13 @@ const ITERATIONS: u64 = 100000;
 
 fn run(machine: &mut Machine, program: &MachineProgram, print: bool) -> Result<()> {
     for input in START..END + 1 {
-        machine.state().push(Uint64(input));
+        machine.state_mut().push(Uint64(input));
         machine.run(program)?;
-        let value = machine.state().pop()?;
+        let value = machine.state_mut().pop()?;
         if print {
             println!("fib({input}) = {}", value.as_u64());
         }
-        machine.state().reset();
+        machine.state_mut().reset();
     }
     Ok(())
 }

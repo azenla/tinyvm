@@ -1,6 +1,7 @@
+use crate::machine::MachineLoopState;
 use crate::machine::error::Result;
 use crate::machine::ops::OpHandler;
-use crate::machine::{MachineLoopState, MachineState};
+use crate::machine::state::MachineState;
 use crate::op::{Op, OpCode};
 
 pub struct AddOp;

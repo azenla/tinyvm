@@ -1,13 +1,13 @@
 use crate::machine::error::{MachineError, Result};
 use crate::machine::ops::{InlinedOpHandlers, OpHandlerSet};
 use crate::machine::registers::RegisterBank;
-use crate::machine::value::MachineValue;
-use crate::op::{Op, OpArg};
 use crate::program::RawProgram;
+use state::MachineState;
 
 pub mod error;
 pub mod ops;
 pub mod registers;
+pub mod state;
 pub mod value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,65 +21,6 @@ pub enum MachineLoopState {
 pub enum MachineProgram<'program> {
     Uncompiled(&'program RawProgram<'program>),
     Inlined(InlinedOpHandlers<'program>),
-}
-
-#[derive(Clone, Default)]
-pub struct MachineState {
-    stack: Vec<MachineValue>,
-    calls: Vec<MachineValue>,
-    bank: RegisterBank,
-    current: usize,
-}
-
-impl MachineState {
-    fn jmp(&mut self, op: &Op) -> Result<()> {
-        self.current = match op.arg {
-            OpArg::Instruction(instruction) => instruction as usize,
-            _ => return Err(MachineError::InstructionExpected),
-        };
-        Ok(())
-    }
-
-    fn call(&mut self, op: &Op) -> Result<()> {
-        let current = self.current + 1;
-        self.jmp(op)?;
-        self.calls.push(MachineValue::ReturnAddress(current));
-        Ok(())
-    }
-
-    fn ret(&mut self) -> Result<()> {
-        let value = self.calls.pop().ok_or(MachineError::StackEmpty)?;
-        self.current = match value {
-            MachineValue::ReturnAddress(value) => value,
-            _ => return Err(MachineError::InstructionExpected),
-        };
-        Ok(())
-    }
-
-    pub fn push(&mut self, value: MachineValue) {
-        self.stack.push(value);
-    }
-
-    pub fn pop(&mut self) -> Result<MachineValue> {
-        self.stack.pop().ok_or(MachineError::StackEmpty)
-    }
-
-    pub fn reset(&mut self) {
-        if !self.stack.is_empty() {
-            self.stack.clear();
-        }
-
-        if !self.calls.is_empty() {
-            self.calls.clear();
-        }
-
-        self.current = 0;
-        self.bank.reset();
-    }
-
-    pub fn bank(&self) -> &RegisterBank {
-        &self.bank
-    }
 }
 
 #[derive(Clone)]
@@ -99,7 +40,7 @@ impl Machine {
     fn step_shared(&mut self, result: Result<MachineLoopState>) -> Result<MachineLoopState> {
         let state = result?;
         if state == MachineLoopState::Next {
-            self.state.current += 1;
+            self.state.set_instruction(self.state.instruction() + 1)
         }
         Ok(state)
     }
@@ -107,7 +48,7 @@ impl Machine {
     pub fn step_uncompiled(&mut self, program: &RawProgram) -> Result<MachineLoopState> {
         let op = program
             .ops()
-            .get(self.state.current)
+            .get(self.state.instruction())
             .ok_or(MachineError::InstructionOverflow)?;
         let handler = self
             .handlers
@@ -120,7 +61,7 @@ impl Machine {
     pub fn step_inlined(&mut self, program: &InlinedOpHandlers) -> Result<MachineLoopState> {
         let (op, handler) = program
             .ops()
-            .get(self.state.current)
+            .get(self.state.instruction())
             .ok_or(MachineError::InstructionOverflow)?;
         let result = handler.perform(&mut self.state, op);
         self.step_shared(result)
@@ -153,7 +94,11 @@ impl Machine {
         Ok(())
     }
 
-    pub fn state(&mut self) -> &mut MachineState {
+    pub fn state(&mut self) -> &MachineState {
+        &mut self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut MachineState {
         &mut self.state
     }
 }
