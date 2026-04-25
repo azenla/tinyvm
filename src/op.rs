@@ -1,3 +1,4 @@
+pub mod dataflow;
 mod impls;
 
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
