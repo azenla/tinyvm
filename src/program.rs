@@ -1,6 +1,8 @@
 use crate::op::Op;
 use std::borrow::Cow;
 
+pub mod textual;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RawProgram<'ops> {
     ops: Cow<'ops, [Op]>,

@@ -159,10 +159,6 @@ impl OpArg {
 }
 
 impl Op {
-    pub const fn new(code: OpCode, arg: OpArg) -> Self {
-        Self { code, arg }
-    }
-
     pub fn decode(buffer: &[u8]) -> Option<Self> {
         if buffer.len() != Self::encoded_len() {
             return None;

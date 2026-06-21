@@ -1,4 +1,4 @@
-mod impls;
+mod numerics;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub enum MachineValue {

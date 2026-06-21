@@ -1,4 +1,5 @@
-mod impls;
+mod encoded;
+pub mod textual;
 
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 #[repr(u8)]
@@ -20,6 +21,28 @@ pub enum OpCode {
     CountLeadingOnes = 14,
     CountTrailingZeros = 15,
     CountTrailingOnes = 16,
+}
+
+impl OpCode {
+    pub const ALL: &'static [OpCode] = &[
+        Self::Push,
+        Self::Pop,
+        Self::Add,
+        Self::Subtract,
+        Self::Multiply,
+        Self::Divide,
+        Self::JumpIfEqual,
+        Self::Exit,
+        Self::JumpIfZero,
+        Self::Call,
+        Self::Return,
+        Self::Jump,
+        Self::Remainder,
+        Self::CountLeadingZeros,
+        Self::CountLeadingOnes,
+        Self::CountTrailingZeros,
+        Self::CountTrailingOnes,
+    ];
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
@@ -46,10 +69,33 @@ pub enum OpArg {
     Instruction(u64) = 19,
 }
 
+impl OpArg {
+    pub fn is_register(&self) -> bool {
+        matches!(
+            self,
+            OpArg::Register1
+                | OpArg::Register2
+                | OpArg::Register3
+                | OpArg::Register4
+                | OpArg::Register5
+                | OpArg::Register6
+                | OpArg::Register7
+                | OpArg::Register8
+                | OpArg::Register9
+        )
+    }
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Debug)]
 pub struct Op {
     pub code: OpCode,
     pub arg: OpArg,
+}
+
+impl Op {
+    pub const fn new(code: OpCode, arg: OpArg) -> Self {
+        Self { code, arg }
+    }
 }
 
 #[macro_export]
