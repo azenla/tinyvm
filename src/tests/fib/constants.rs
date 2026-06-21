@@ -1,0 +1,78 @@
+use crate::op::OpArg::{Instruction, Register1, Register2, Register3, Register4, Uint64};
+use crate::op::OpCode::{Add, Exit, Jump, JumpIfZero, Pop, Push, Subtract};
+use crate::program::RawProgram;
+use crate::{op, program};
+
+pub const FIB_PROGRAM_TEXT: &str = "\
+# Pop the input value into r3.
+pop r3
+# fib(0) = 0: store in r1.
+push 0u64
+pop r1
+# fib(1) = 1: store in r2.
+push 1u64
+pop r2
+# Pushes the counter-value. (loop start: instruction 5)
+push r3
+# Exit loop if counter-value == 0.
+jiz 20p
+# Calculate next fibonacci: next = r1 + r2
+push r1
+push r2
+add
+# Store result in r4.
+pop r4
+# Shift values in registers: r1 => r2, r2 => next
+push r2
+pop r1
+push r4
+pop r2
+# Decrement the counter-value: r3 = r3 - 1
+push r3
+push 1u64
+sub
+pop r3
+# Jump back to the loop start.
+jmp 5p
+# Push the result to the stack.
+push r1
+# Exit.
+exit
+";
+
+pub static FIB_PROGRAM: RawProgram = program!(
+    // Pop the input value into r3.
+    op!(Pop, Register3),
+    // fib(0) = 0: store in r1.
+    op!(Push, Uint64(0)),
+    op!(Pop, Register1),
+    // fib(1) = 1: store in r2.
+    op!(Push, Uint64(1)),
+    op!(Pop, Register2),
+    // Pushes the counter-value. (loop start: instruction 5)
+    op!(Push, Register3),
+    // Exit loop if counter-value == 0.
+    op!(JumpIfZero, Instruction(20)),
+    // Calculate next fibonacci: next = r1 + r2
+    op!(Push, Register1),
+    op!(Push, Register2),
+    op!(Add),
+    // Store result in r4.
+    op!(Pop, Register4),
+    // Shift values in registers: r1 => R2, r2 => next
+    op!(Push, Register2),
+    op!(Pop, Register1),
+    op!(Push, Register4),
+    op!(Pop, Register2),
+    // Decrement the counter-value: r3 = r3 - 1
+    op!(Push, Register3),
+    op!(Push, Uint64(1)),
+    op!(Subtract),
+    op!(Pop, Register3),
+    // Jump back to the loop start.
+    op!(Jump, Instruction(5)),
+    // Push the result to the stack.
+    op!(Push, Register1),
+    // Exit.
+    op!(Exit)
+);

@@ -12,11 +12,3 @@ path = "src/lib.rs"
 [[bin]]
 name = "tinyvm"
 path = "src/main.rs"
-
-[[example]]
-name = "fib"
-path = "examples/fib.rs"
-
-[[example]]
-name = "textual"
-path = "examples/textual.rs"
