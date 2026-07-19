@@ -8,7 +8,6 @@ use crate::machine::ops::stack::{PopOp, PushOp};
 use crate::machine::{MachineLoopState, MachineState};
 use crate::op::{Op, OpCode};
 use crate::program::RawProgram;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod control;
@@ -24,7 +23,7 @@ pub trait OpHandler {
 
 #[derive(Clone)]
 pub struct OpHandlerSet {
-    handlers: HashMap<OpCode, GlobalOpHandler>,
+    handlers: Vec<Option<GlobalOpHandler>>,
 }
 
 impl Default for OpHandlerSet {
@@ -36,17 +35,22 @@ impl Default for OpHandlerSet {
 impl OpHandlerSet {
     pub fn new() -> Self {
         Self {
-            handlers: HashMap::new(),
+            handlers: Vec::new(),
         }
     }
 
     pub fn add(&mut self, handler: impl OpHandler + 'static) {
-        self.handlers
-            .insert(handler.code(), Arc::new(Box::new(handler)));
+        let code = handler.code() as u8;
+        if self.handlers.len() <= code as usize {
+            self.handlers.resize(code as usize + 1, None);
+        }
+        self.handlers[code as usize] = Some(Arc::new(Box::new(handler)));
     }
 
     pub fn get(&self, code: &OpCode) -> Option<&GlobalOpHandler> {
-        self.handlers.get(code)
+        self.handlers
+            .get(*code as u8 as usize)
+            .and_then(|item| if item.is_some() { item.as_ref() } else { None })
     }
 
     pub fn inline<'ops>(&self, program: &'ops RawProgram<'ops>) -> Result<InlinedOpHandlers<'ops>> {
