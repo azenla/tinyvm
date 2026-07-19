@@ -85,6 +85,6 @@ impl OpHandler for ReturnOp {
 
     fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         machine.ret()?;
-        Ok(MachineLoopState::Next)
+        Ok(MachineLoopState::Stay)
     }
 }

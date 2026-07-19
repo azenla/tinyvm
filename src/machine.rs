@@ -48,7 +48,7 @@ impl MachineState {
     }
 
     fn ret(&mut self) -> Result<()> {
-        let value = self.calls.pop().ok_or(MachineError::StackEmpty)?;
+        let value = self.calls.pop().ok_or(MachineError::CallStackEmpty)?;
         self.current = match value {
             MachineValue::ReturnAddress(value) => value,
             _ => return Err(MachineError::InstructionExpected),

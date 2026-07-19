@@ -153,11 +153,11 @@ impl FromStr for OpArg {
             };
         }
 
-        let Some(sign_index) = string.find(['u', 'i', 'p']) else {
+        let Some(sign_index) = lower.find(['u', 'i', 'p']) else {
             return Err(TextualParseError::InvalidToken(string.to_string()));
         };
 
-        let value = &string[..sign_index];
+        let value = &lower[..sign_index];
         let sign = &lower[sign_index..sign_index + 1];
 
         if sign == "p" {
