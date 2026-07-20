@@ -14,7 +14,7 @@ pub mod control;
 pub mod math;
 pub mod stack;
 
-pub type GlobalOpHandler = Arc<Box<dyn OpHandler>>;
+pub type GlobalOpHandler = Arc<dyn OpHandler>;
 
 pub trait OpHandler {
     fn code(&self) -> OpCode;
@@ -44,7 +44,7 @@ impl OpHandlerSet {
         if self.handlers.len() <= code as usize {
             self.handlers.resize(code as usize + 1, None);
         }
-        self.handlers[code as usize] = Some(Arc::new(Box::new(handler)));
+        self.handlers[code as usize] = Some(Arc::new(handler));
     }
 
     pub fn get(&self, code: &OpCode) -> Option<&GlobalOpHandler> {
