@@ -1,6 +1,8 @@
 use crate::machine::MachineState;
 use crate::machine::error::{MachineError, Result};
-use crate::machine::optimized::{OptimizedOp, OptimizedProgram};
+use crate::machine::optimized::{BinaryOpKind, OptimizedOp, OptimizedProgram, Source};
+use crate::machine::registers::RegisterBank;
+use crate::machine::value::MachineValue;
 use std::sync::Arc;
 
 mod platform;
@@ -17,10 +19,54 @@ use x86_64::Assembler;
 
 type EntryFunction = unsafe extern "C" fn(*mut MachineState, usize) -> i64;
 
+// The fast paths generate loads and stores of raw value slots, which relies
+// on the `repr(u8)` layout of MachineValue: the tag byte at offset zero and
+// word-sized payloads at PAYLOAD_OFFSET.
+const _: () = assert!(std::mem::size_of::<MachineValue>() == 16);
+const _: () = assert!(std::mem::align_of::<MachineValue>() == 8);
+
+pub(super) const PAYLOAD_OFFSET: usize = 8;
+
+/// The tag byte identifying a `MachineValue::Uint64`, the type the generated
+/// fast paths specialize for.
+pub(super) fn uint64_tag() -> u8 {
+    let value = MachineValue::Uint64(0);
+    unsafe { *(&value as *const MachineValue as *const u8) }
+}
+
+/// An operand a fast path can evaluate without calling a helper: a register
+/// slot checked for the `Uint64` tag at run time, or a `Uint64` immediate.
+#[derive(Clone, Copy)]
+pub(super) enum FastOperand {
+    Register(usize),
+    Immediate(u64),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum FastBinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+}
+
+/// Byte offset of a register's value slot from the machine state pointer.
+fn slot(index: usize) -> usize {
+    std::mem::offset_of!(MachineState, bank) + RegisterBank::slot_offset(index)
+}
+
+fn fast_operand(source: &Source) -> Option<FastOperand> {
+    match source {
+        Source::Register(index) => Some(FastOperand::Register(slot(*index))),
+        Source::Value(MachineValue::Uint64(value)) => Some(FastOperand::Immediate(*value)),
+        Source::Value(_) => None,
+    }
+}
+
 /// An optimized program translated to native code. The generated code keeps
 /// control flow, dispatch, and program-counter bookkeeping in machine
-/// instructions and calls the `helper` functions below for op bodies, so
-/// execution semantics match the interpreter exactly.
+/// instructions; hot fused ops are inlined with a `Uint64` fast path, and
+/// everything else calls the `helper` functions below, so execution semantics
+/// match the interpreter exactly.
 #[derive(Clone)]
 pub struct JitProgram {
     code: Arc<JitCode>,
@@ -135,20 +181,71 @@ fn emit(assembler: &mut Assembler, op: &OptimizedOp, pc: usize, length: usize) {
             assembler.call(helper::finish as *const (), &[position]);
             assembler.jump_epilogue();
         }
-        OptimizedOp::Binary { .. } => {
-            assembler.call(helper::binary_values as *const (), &[data]);
+        OptimizedOp::Binary {
+            kind,
+            lhs,
+            rhs,
+            dst,
+        } => {
+            let fast = match kind {
+                BinaryOpKind::Add => Some(FastBinaryOp::Add),
+                BinaryOpKind::Subtract => Some(FastBinaryOp::Subtract),
+                BinaryOpKind::Multiply => Some(FastBinaryOp::Multiply),
+                // Dividing an actual zero must reach the interpreter's own
+                // division, not a hardware trap.
+                BinaryOpKind::Divide | BinaryOpKind::Remainder => None,
+            };
+            match (fast, fast_operand(lhs), fast_operand(rhs)) {
+                (Some(kind), Some(lhs), Some(rhs)) => {
+                    assembler.binary_fast(
+                        kind,
+                        lhs,
+                        rhs,
+                        slot(*dst),
+                        helper::binary_values as *const (),
+                        data,
+                    );
+                }
+                _ => assembler.call(helper::binary_values as *const (), &[data]),
+            }
         }
-        OptimizedOp::Copy { .. } => {
-            assembler.call(helper::copy_values as *const (), &[data]);
+        OptimizedOp::Copy { src, dst } => match src {
+            Source::Register(index) => assembler.copy_slot(slot(*index), slot(*dst)),
+            Source::Value(value) => {
+                assembler.copy_constant(value as *const MachineValue as usize, slot(*dst));
+            }
+        },
+        OptimizedOp::JumpIfEqualValues { lhs, rhs, target } => {
+            if let (Source::Value(lhs), Source::Value(rhs)) = (lhs, rhs) {
+                if rhs == lhs {
+                    assembler.jump(*target);
+                }
+            } else if let (Some(lhs), Some(rhs)) = (fast_operand(lhs), fast_operand(rhs)) {
+                assembler.jump_if_equal_fast(
+                    lhs,
+                    rhs,
+                    *target,
+                    helper::jump_if_equal_values as *const (),
+                    data,
+                );
+            } else {
+                assembler.call(helper::jump_if_equal_values as *const (), &[data]);
+                assembler.branch_taken(*target);
+            }
         }
-        OptimizedOp::JumpIfEqualValues { target, .. } => {
-            assembler.call(helper::jump_if_equal_values as *const (), &[data]);
-            assembler.branch_taken(*target);
-        }
-        OptimizedOp::JumpIfZeroValue { target, .. } => {
-            assembler.call(helper::jump_if_zero_values as *const (), &[data]);
-            assembler.branch_taken(*target);
-        }
+        OptimizedOp::JumpIfZeroValue { src, target } => match src {
+            Source::Register(index) => assembler.jump_if_zero_fast(
+                slot(*index),
+                *target,
+                helper::jump_if_zero_values as *const (),
+                data,
+            ),
+            Source::Value(value) => {
+                if value.is_zero() {
+                    assembler.jump(*target);
+                }
+            }
+        },
     }
 }
 
@@ -334,15 +431,6 @@ mod helper {
         };
         let result = kind.apply(lhs.resolve(&state.bank), rhs.resolve(&state.bank));
         state.bank.set(*dst, result);
-    }
-
-    pub unsafe extern "C" fn copy_values(state: *mut MachineState, op: *const OptimizedOp) {
-        let state = unsafe { &mut *state };
-        let OptimizedOp::Copy { src, dst } = (unsafe { &*op }) else {
-            unsafe { unreachable_unchecked() }
-        };
-        let value = src.resolve(&state.bank);
-        state.bank.set(*dst, value);
     }
 
     pub unsafe extern "C" fn jump_if_equal_values(

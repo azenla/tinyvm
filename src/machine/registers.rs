@@ -14,6 +14,10 @@ impl RegisterBank {
         Self::default()
     }
 
+    pub(crate) const fn slot_offset(index: usize) -> usize {
+        std::mem::offset_of!(RegisterBank, registers) + index * std::mem::size_of::<MachineValue>()
+    }
+
     pub fn reset(&mut self) {
         self.registers = [MachineValue::None; REGISTER_BANK_COUNT];
     }

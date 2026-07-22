@@ -2,7 +2,11 @@ use crate::op::OpArg;
 
 mod numerics;
 
+// `repr(u8)` gives the value a defined layout — the tag byte at offset zero
+// and the payload of word-sized variants at offset eight — which the jit's
+// generated code relies on to read and write values directly.
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(u8)]
 pub enum MachineValue {
     #[default]
     None,

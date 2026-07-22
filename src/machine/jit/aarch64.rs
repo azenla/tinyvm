@@ -1,3 +1,4 @@
+use super::{FastBinaryOp, FastOperand, PAYLOAD_OFFSET};
 use crate::machine::error::{MachineError, Result};
 
 // Register conventions for generated code: x19 holds the machine state
@@ -22,6 +23,13 @@ struct Fixup {
     at: usize,
     kind: FixupKind,
     target: FixupTarget,
+}
+
+/// A forward branch within a single op's code, patched by `bind` as soon as
+/// its destination is emitted.
+struct PendingBranch {
+    at: usize,
+    kind: FixupKind,
 }
 
 pub(super) struct Assembler {
@@ -136,6 +144,137 @@ impl Assembler {
         self.branch_negative_epilogue();
         self.word(0xF860_7800 | (TABLE << 5) | SCRATCH); // ldr x16, [x20, x0, lsl #3]
         self.word(0xD61F_0000 | (SCRATCH << 5)); // br x16
+    }
+
+    fn forward(&mut self, word: u32, kind: FixupKind) -> PendingBranch {
+        let branch = PendingBranch {
+            at: self.code.len(),
+            kind,
+        };
+        self.word(word);
+        branch
+    }
+
+    fn bind(&mut self, branch: PendingBranch) {
+        let delta = ((self.code.len() - branch.at) / 4) as u32;
+        let (mask, shift) = match branch.kind {
+            FixupKind::Imm26 => (0x03FF_FFFF, 0),
+            FixupKind::Imm19 => (0x0007_FFFF, 5),
+        };
+        let position = branch.at;
+        let existing = u32::from_le_bytes(self.code[position..position + 4].try_into().unwrap());
+        let patched = existing | ((delta & mask) << shift);
+        self.code[position..position + 4].copy_from_slice(&patched.to_le_bytes());
+    }
+
+    /// Loads an operand's payload into `register` (x0 or x1). Register
+    /// operands are checked for the `Uint64` tag first; a failed check
+    /// branches to the pending slow path.
+    fn load_operand(
+        &mut self,
+        operand: FastOperand,
+        register: u32,
+        checks: &mut Vec<PendingBranch>,
+    ) {
+        match operand {
+            FastOperand::Register(slot) => {
+                let tag = u32::from(super::uint64_tag());
+                let payload = ((slot + PAYLOAD_OFFSET) / 8) as u32;
+                self.word(0x3940_0000 | ((slot as u32) << 10) | (STATE << 5) | 2); // ldrb w2, [x19, #slot]
+                self.word(0x7100_001F | (tag << 10) | (2 << 5)); // cmp w2, #tag
+                checks.push(self.forward(0x5400_0001, FixupKind::Imm19)); // b.ne slow
+                self.word(0xF940_0000 | (payload << 10) | (STATE << 5) | register); // ldr
+            }
+            FastOperand::Immediate(value) => self.load_immediate(register, value),
+        }
+    }
+
+    /// Stores the `Uint64` in x0 to a register slot: the payload word, then a
+    /// whole tag word so the slot's padding stays defined.
+    fn store_result(&mut self, destination: usize) {
+        let payload = ((destination + PAYLOAD_OFFSET) / 8) as u32;
+        self.word(0xF900_0000 | (payload << 10) | (STATE << 5)); // str x0, [x19, #payload]
+        self.load_immediate(1, u64::from(super::uint64_tag()));
+        self.word(0xF900_0000 | (((destination / 8) as u32) << 10) | (STATE << 5) | 1); // str x1, [x19, #slot]
+    }
+
+    fn slow_path(&mut self, checks: Vec<PendingBranch>, emit: impl FnOnce(&mut Self)) {
+        if checks.is_empty() {
+            return;
+        }
+        let done = self.forward(0x1400_0000, FixupKind::Imm26); // b done
+        for check in checks {
+            self.bind(check);
+        }
+        emit(self);
+        self.bind(done);
+    }
+
+    pub(super) fn binary_fast(
+        &mut self,
+        kind: FastBinaryOp,
+        lhs: FastOperand,
+        rhs: FastOperand,
+        destination: usize,
+        helper: *const (),
+        op: u64,
+    ) {
+        let mut checks = Vec::new();
+        self.load_operand(lhs, 0, &mut checks);
+        self.load_operand(rhs, 1, &mut checks);
+        self.word(match kind {
+            FastBinaryOp::Add => 0x8B01_0000,      // add x0, x0, x1
+            FastBinaryOp::Subtract => 0xCB01_0000, // sub x0, x0, x1
+            FastBinaryOp::Multiply => 0x9B01_7C00, // mul x0, x0, x1
+        });
+        self.store_result(destination);
+        self.slow_path(checks, |assembler| assembler.call(helper, &[op]));
+    }
+
+    pub(super) fn copy_slot(&mut self, source: usize, destination: usize) {
+        self.word(0xA940_0400 | (((source / 8) as u32) << 15) | (STATE << 5)); // ldp x0, x1, [x19, #source]
+        self.word(0xA900_0400 | (((destination / 8) as u32) << 15) | (STATE << 5)); // stp x0, x1, [x19, #destination]
+    }
+
+    pub(super) fn copy_constant(&mut self, constant: usize, destination: usize) {
+        self.load_immediate(SCRATCH, constant as u64);
+        self.word(0xA940_0400 | (SCRATCH << 5)); // ldp x0, x1, [x16]
+        self.word(0xA900_0400 | (((destination / 8) as u32) << 15) | (STATE << 5)); // stp x0, x1, [x19, #destination]
+    }
+
+    pub(super) fn jump_if_zero_fast(
+        &mut self,
+        source: usize,
+        target: usize,
+        helper: *const (),
+        op: u64,
+    ) {
+        let mut checks = Vec::new();
+        self.load_operand(FastOperand::Register(source), 0, &mut checks);
+        self.branch_fixup(0xB400_0000, FixupKind::Imm19, FixupTarget::Op(target)); // cbz x0
+        self.slow_path(checks, |assembler| {
+            assembler.call(helper, &[op]);
+            assembler.branch_taken(target);
+        });
+    }
+
+    pub(super) fn jump_if_equal_fast(
+        &mut self,
+        lhs: FastOperand,
+        rhs: FastOperand,
+        target: usize,
+        helper: *const (),
+        op: u64,
+    ) {
+        let mut checks = Vec::new();
+        self.load_operand(lhs, 0, &mut checks);
+        self.load_operand(rhs, 1, &mut checks);
+        self.word(0xEB01_001F); // cmp x0, x1
+        self.branch_fixup(0x5400_0000, FixupKind::Imm19, FixupTarget::Op(target)); // b.eq
+        self.slow_path(checks, |assembler| {
+            assembler.call(helper, &[op]);
+            assembler.branch_taken(target);
+        });
     }
 
     pub(super) fn patch(&mut self, offsets: &[usize], overflow: usize) -> Result<()> {
