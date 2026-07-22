@@ -1,5 +1,5 @@
-use crate::machine::compiled::CompiledProgram;
 use crate::machine::ops::OpHandlerSet;
+use crate::machine::optimized::OptimizedProgram;
 use crate::machine::value::MachineValue;
 use crate::machine::{Machine, MachineProgram, ops};
 use crate::op::OpArg::{Instruction, Uint64};
@@ -44,8 +44,21 @@ fn returns_to_instruction_after_call_inlined() {
 }
 
 #[test]
-fn returns_to_instruction_after_call_compiled() {
-    let compiled = CompiledProgram::compile(&CALL_PROGRAM).unwrap();
-    let program = MachineProgram::Compiled(compiled);
+fn returns_to_instruction_after_call_optimized() {
+    let optimized = OptimizedProgram::compile(&CALL_PROGRAM).unwrap();
+    let program = MachineProgram::Optimized(optimized);
+    assert_eq!(run(ops::all(), program), MachineValue::Uint64(99));
+}
+
+#[cfg(all(
+    any(unix, windows),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn returns_to_instruction_after_call_jit() {
+    use crate::machine::jit::JitProgram;
+
+    let optimized = OptimizedProgram::compile(&CALL_PROGRAM).unwrap();
+    let program = MachineProgram::Jit(JitProgram::compile(&optimized).unwrap());
     assert_eq!(run(ops::all(), program), MachineValue::Uint64(99));
 }

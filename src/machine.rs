@@ -1,14 +1,24 @@
-use crate::machine::compiled::CompiledProgram;
 use crate::machine::error::{MachineError, Result};
+#[cfg(all(
+    any(unix, windows),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use crate::machine::jit::JitProgram;
 use crate::machine::ops::{InlinedOpHandlers, OpHandlerSet};
+use crate::machine::optimized::OptimizedProgram;
 use crate::machine::registers::RegisterBank;
 use crate::machine::value::MachineValue;
 use crate::op::{Op, OpArg};
 use crate::program::RawProgram;
 
-pub mod compiled;
 pub mod error;
+#[cfg(all(
+    any(unix, windows),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod jit;
 pub mod ops;
+pub mod optimized;
 pub mod registers;
 pub mod value;
 
@@ -23,7 +33,12 @@ pub enum MachineLoopState {
 pub enum MachineProgram<'program> {
     Uncompiled(&'program RawProgram<'program>),
     Inlined(InlinedOpHandlers<'program>),
-    Compiled(CompiledProgram),
+    Optimized(OptimizedProgram),
+    #[cfg(all(
+        any(unix, windows),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    Jit(JitProgram),
 }
 
 #[derive(Clone, Default)]
@@ -129,7 +144,7 @@ impl Machine {
         self.step_shared(result)
     }
 
-    pub fn step_compiled(&mut self, program: &CompiledProgram) -> Result<MachineLoopState> {
+    pub fn step_optimized(&mut self, program: &OptimizedProgram) -> Result<MachineLoopState> {
         let pc = self.state.current;
         let op = program
             .ops()
@@ -152,11 +167,16 @@ impl Machine {
         match program {
             MachineProgram::Uncompiled(program) => self.step_uncompiled(program),
             MachineProgram::Inlined(program) => self.step_inlined(program),
-            MachineProgram::Compiled(program) => self.step_compiled(program),
+            MachineProgram::Optimized(program) => self.step_optimized(program),
+            #[cfg(all(
+                any(unix, windows),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            MachineProgram::Jit(_) => Err(MachineError::StepUnsupported),
         }
     }
 
-    fn run_compiled(&mut self, program: &CompiledProgram) -> Result<()> {
+    fn run_optimized(&mut self, program: &OptimizedProgram) -> Result<()> {
         let ops = program.ops();
         let mut pc = self.state.current;
         let result = loop {
@@ -189,7 +209,13 @@ impl Machine {
                 }
             },
 
-            MachineProgram::Compiled(program) => return self.run_compiled(program),
+            MachineProgram::Optimized(program) => return self.run_optimized(program),
+
+            #[cfg(all(
+                any(unix, windows),
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            MachineProgram::Jit(program) => return program.run(&mut self.state),
         }
 
         Ok(())

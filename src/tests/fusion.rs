@@ -1,4 +1,4 @@
-use crate::machine::compiled::CompiledProgram;
+use crate::machine::optimized::OptimizedProgram;
 use crate::machine::value::MachineValue;
 use crate::machine::{Machine, MachineProgram, ops};
 use crate::op;
@@ -7,16 +7,30 @@ use crate::op::OpCode::{Add, Exit, Jump, JumpIfEqual, Pop, Push};
 use crate::program;
 use crate::program::RawProgram;
 
-fn run_compiled(program: &RawProgram) -> MachineValue {
-    let compiled = CompiledProgram::compile(program).unwrap();
+fn run_optimized(program: &RawProgram) -> MachineValue {
+    let optimized = OptimizedProgram::compile(program).unwrap();
     let mut machine = Machine::new(ops::all());
-    machine.run(&MachineProgram::Compiled(compiled)).unwrap();
+    machine.run(&MachineProgram::Optimized(optimized)).unwrap();
     machine.state().pop().unwrap()
 }
 
 fn run_uncompiled(program: &RawProgram) -> MachineValue {
     let mut machine = Machine::new(ops::all());
     machine.run(&MachineProgram::Uncompiled(program)).unwrap();
+    machine.state().pop().unwrap()
+}
+
+#[cfg(all(
+    any(unix, windows),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn run_jit(program: &RawProgram) -> MachineValue {
+    use crate::machine::jit::JitProgram;
+
+    let optimized = OptimizedProgram::compile(program).unwrap();
+    let jit = JitProgram::compile(&optimized).unwrap();
+    let mut machine = Machine::new(ops::all());
+    machine.run(&MachineProgram::Jit(jit)).unwrap();
     machine.state().pop().unwrap()
 }
 
@@ -29,8 +43,8 @@ fn fuses_stack_neutral_sequences() {
         op!(Pop, Register3),
         op!(Exit),
     );
-    let compiled = CompiledProgram::compile(&PROGRAM).unwrap();
-    assert_eq!(compiled.ops().len(), 2);
+    let optimized = OptimizedProgram::compile(&PROGRAM).unwrap();
+    assert_eq!(optimized.ops().len(), 2);
 }
 
 // The jump lands on the `pop`, so `push 99; pop r1` must not be fused into a
@@ -46,7 +60,12 @@ fn jump_target_inside_fusible_pair_blocks_fusion() {
         op!(Exit),
     );
     assert_eq!(run_uncompiled(&PROGRAM), MachineValue::Uint64(5));
-    assert_eq!(run_compiled(&PROGRAM), MachineValue::Uint64(5));
+    assert_eq!(run_optimized(&PROGRAM), MachineValue::Uint64(5));
+    #[cfg(all(
+        any(unix, windows),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    assert_eq!(run_jit(&PROGRAM), MachineValue::Uint64(5));
 }
 
 // Mixed-type equality is not symmetric: Uint8(5) == Uint16(261) truncates the
@@ -64,5 +83,10 @@ fn fused_jump_if_equal_preserves_operand_order() {
         op!(Exit),
     );
     assert_eq!(run_uncompiled(&PROGRAM), MachineValue::Uint64(1));
-    assert_eq!(run_compiled(&PROGRAM), MachineValue::Uint64(1));
+    assert_eq!(run_optimized(&PROGRAM), MachineValue::Uint64(1));
+    #[cfg(all(
+        any(unix, windows),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    assert_eq!(run_jit(&PROGRAM), MachineValue::Uint64(1));
 }

@@ -12,6 +12,8 @@ pub enum MachineError {
     RegisterExpected,
     CallStackEmpty,
     InvalidOpCode,
+    MemoryUnavailable,
+    StepUnsupported,
 }
 
 impl Display for MachineError {
@@ -24,6 +26,8 @@ impl Display for MachineError {
             MachineError::RegisterExpected => write!(f, "register expected"),
             MachineError::CallStackEmpty => write!(f, "call stack empty"),
             MachineError::InvalidOpCode => write!(f, "invalid opcode"),
+            MachineError::MemoryUnavailable => write!(f, "memory unavailable"),
+            MachineError::StepUnsupported => write!(f, "step unsupported"),
         }
     }
 }

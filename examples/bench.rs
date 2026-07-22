@@ -1,6 +1,6 @@
 use std::str::FromStr;
 use std::time::Instant;
-use tinyvm::machine::compiled::CompiledProgram;
+use tinyvm::machine::optimized::OptimizedProgram;
 use tinyvm::machine::value::MachineValue;
 use tinyvm::machine::{Machine, MachineProgram, ops};
 use tinyvm::program::RawProgram;
@@ -29,17 +29,31 @@ fn main() {
     let text = std::fs::read_to_string("programs/fib.tinyvm").unwrap();
     let program = RawProgram::from_str(&text).unwrap();
 
-    let modes = [
+    let mut modes = vec![
         ("uncompiled", MachineProgram::Uncompiled(&program)),
         (
             "inlined",
             MachineProgram::Inlined(ops::all().inline(&program).unwrap()),
         ),
         (
-            "compiled",
-            MachineProgram::Compiled(CompiledProgram::compile(&program).unwrap()),
+            "optimized",
+            MachineProgram::Optimized(OptimizedProgram::compile(&program).unwrap()),
         ),
     ];
+
+    #[cfg(all(
+        any(unix, windows),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        use tinyvm::machine::jit::JitProgram;
+
+        let optimized = OptimizedProgram::compile(&program).unwrap();
+        modes.push((
+            "jit",
+            MachineProgram::Jit(JitProgram::compile(&optimized).unwrap()),
+        ));
+    }
 
     for (label, prog) in &modes {
         let mut machine = Machine::new(ops::all());

@@ -26,7 +26,7 @@ impl Source {
     }
 
     #[inline(always)]
-    fn resolve(&self, bank: &RegisterBank) -> MachineValue {
+    pub(crate) fn resolve(&self, bank: &RegisterBank) -> MachineValue {
         match *self {
             Source::Register(index) => bank.get(index),
             Source::Value(value) => value,
@@ -56,7 +56,7 @@ impl BinaryOpKind {
     }
 
     #[inline(always)]
-    fn apply(&self, lhs: MachineValue, rhs: MachineValue) -> MachineValue {
+    pub(crate) fn apply(&self, lhs: MachineValue, rhs: MachineValue) -> MachineValue {
         match self {
             BinaryOpKind::Add => lhs + rhs,
             BinaryOpKind::Subtract => lhs - rhs,
@@ -68,7 +68,7 @@ impl BinaryOpKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CompiledOp {
+pub enum OptimizedOp {
     PushValue(MachineValue),
     PushRegister(usize),
     PopRegister(usize),
@@ -108,36 +108,36 @@ pub enum CompiledOp {
     },
 }
 
-impl CompiledOp {
+impl OptimizedOp {
     pub fn compile(op: &Op) -> Result<Self> {
         Ok(match op.code {
             OpCode::Push => match op.arg.register_index() {
-                Some(index) => CompiledOp::PushRegister(index),
+                Some(index) => OptimizedOp::PushRegister(index),
                 None => match op.arg {
                     OpArg::Instruction(_) => return Err(MachineError::ValueExpected),
-                    arg => CompiledOp::PushValue(MachineValue::from(arg)),
+                    arg => OptimizedOp::PushValue(MachineValue::from(arg)),
                 },
             },
-            OpCode::Pop => CompiledOp::PopRegister(
+            OpCode::Pop => OptimizedOp::PopRegister(
                 op.arg
                     .register_index()
                     .ok_or(MachineError::RegisterExpected)?,
             ),
-            OpCode::Add => CompiledOp::Add,
-            OpCode::Subtract => CompiledOp::Subtract,
-            OpCode::Multiply => CompiledOp::Multiply,
-            OpCode::Divide => CompiledOp::Divide,
-            OpCode::Remainder => CompiledOp::Remainder,
-            OpCode::JumpIfEqual => CompiledOp::JumpIfEqual(instruction_target(op)?),
-            OpCode::JumpIfZero => CompiledOp::JumpIfZero(instruction_target(op)?),
-            OpCode::Jump => CompiledOp::Jump(instruction_target(op)?),
-            OpCode::Call => CompiledOp::Call(instruction_target(op)?),
-            OpCode::Return => CompiledOp::Return,
-            OpCode::Exit => CompiledOp::Exit,
-            OpCode::CountLeadingZeros => CompiledOp::CountLeadingZeros,
-            OpCode::CountLeadingOnes => CompiledOp::CountLeadingOnes,
-            OpCode::CountTrailingZeros => CompiledOp::CountTrailingZeros,
-            OpCode::CountTrailingOnes => CompiledOp::CountTrailingOnes,
+            OpCode::Add => OptimizedOp::Add,
+            OpCode::Subtract => OptimizedOp::Subtract,
+            OpCode::Multiply => OptimizedOp::Multiply,
+            OpCode::Divide => OptimizedOp::Divide,
+            OpCode::Remainder => OptimizedOp::Remainder,
+            OpCode::JumpIfEqual => OptimizedOp::JumpIfEqual(instruction_target(op)?),
+            OpCode::JumpIfZero => OptimizedOp::JumpIfZero(instruction_target(op)?),
+            OpCode::Jump => OptimizedOp::Jump(instruction_target(op)?),
+            OpCode::Call => OptimizedOp::Call(instruction_target(op)?),
+            OpCode::Return => OptimizedOp::Return,
+            OpCode::Exit => OptimizedOp::Exit,
+            OpCode::CountLeadingZeros => OptimizedOp::CountLeadingZeros,
+            OpCode::CountLeadingOnes => OptimizedOp::CountLeadingOnes,
+            OpCode::CountTrailingZeros => OptimizedOp::CountTrailingZeros,
+            OpCode::CountTrailingOnes => OptimizedOp::CountTrailingOnes,
         })
     }
 
@@ -156,7 +156,7 @@ impl CompiledOp {
             && let Some(dst) = ops[3].arg.register_index()
         {
             return Some((
-                CompiledOp::Binary {
+                OptimizedOp::Binary {
                     kind,
                     lhs,
                     rhs,
@@ -174,7 +174,7 @@ impl CompiledOp {
             && let OpArg::Instruction(target) = ops[2].arg
         {
             return Some((
-                CompiledOp::JumpIfEqualValues {
+                OptimizedOp::JumpIfEqualValues {
                     lhs,
                     rhs,
                     target: target as usize,
@@ -191,7 +191,7 @@ impl CompiledOp {
                 && let OpArg::Instruction(target) = ops[1].arg
             {
                 return Some((
-                    CompiledOp::JumpIfZeroValue {
+                    OptimizedOp::JumpIfZeroValue {
                         src,
                         target: target as usize,
                     },
@@ -202,7 +202,7 @@ impl CompiledOp {
             if ops[1].code == OpCode::Pop
                 && let Some(dst) = ops[1].arg.register_index()
             {
-                return Some((CompiledOp::Copy { src, dst }, 2));
+                return Some((OptimizedOp::Copy { src, dst }, 2));
             }
         }
 
@@ -211,12 +211,12 @@ impl CompiledOp {
 
     fn remap(&mut self, remap: impl Fn(usize) -> usize) {
         match self {
-            CompiledOp::JumpIfEqual(target)
-            | CompiledOp::JumpIfZero(target)
-            | CompiledOp::Jump(target)
-            | CompiledOp::Call(target)
-            | CompiledOp::JumpIfEqualValues { target, .. }
-            | CompiledOp::JumpIfZeroValue { target, .. } => *target = remap(*target),
+            OptimizedOp::JumpIfEqual(target)
+            | OptimizedOp::JumpIfZero(target)
+            | OptimizedOp::Jump(target)
+            | OptimizedOp::Call(target)
+            | OptimizedOp::JumpIfEqualValues { target, .. }
+            | OptimizedOp::JumpIfZeroValue { target, .. } => *target = remap(*target),
             _ => {}
         }
     }
@@ -224,50 +224,50 @@ impl CompiledOp {
     #[inline(always)]
     pub(crate) fn perform(&self, machine: &mut MachineState, pc: usize) -> Result<Option<usize>> {
         Ok(match *self {
-            CompiledOp::PushValue(value) => {
+            OptimizedOp::PushValue(value) => {
                 machine.push(value);
                 Some(pc + 1)
             }
-            CompiledOp::PushRegister(index) => {
+            OptimizedOp::PushRegister(index) => {
                 machine.push(machine.bank.get(index));
                 Some(pc + 1)
             }
-            CompiledOp::PopRegister(index) => {
+            OptimizedOp::PopRegister(index) => {
                 let value = machine.pop()?;
                 machine.bank.set(index, value);
                 Some(pc + 1)
             }
-            CompiledOp::Add => {
+            OptimizedOp::Add => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 + value1);
                 Some(pc + 1)
             }
-            CompiledOp::Subtract => {
+            OptimizedOp::Subtract => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 - value1);
                 Some(pc + 1)
             }
-            CompiledOp::Multiply => {
+            OptimizedOp::Multiply => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 * value1);
                 Some(pc + 1)
             }
-            CompiledOp::Divide => {
+            OptimizedOp::Divide => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 / value1);
                 Some(pc + 1)
             }
-            CompiledOp::Remainder => {
+            OptimizedOp::Remainder => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 % value1);
                 Some(pc + 1)
             }
-            CompiledOp::JumpIfEqual(target) => {
+            OptimizedOp::JumpIfEqual(target) => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 if value1 == value2 {
@@ -276,7 +276,7 @@ impl CompiledOp {
                     Some(pc + 1)
                 }
             }
-            CompiledOp::JumpIfZero(target) => {
+            OptimizedOp::JumpIfZero(target) => {
                 let value = machine.pop()?;
                 if value.is_zero() {
                     Some(target)
@@ -284,40 +284,40 @@ impl CompiledOp {
                     Some(pc + 1)
                 }
             }
-            CompiledOp::Jump(target) => Some(target),
-            CompiledOp::Call(target) => {
+            OptimizedOp::Jump(target) => Some(target),
+            OptimizedOp::Call(target) => {
                 machine.calls.push(MachineValue::ReturnAddress(pc + 1));
                 Some(target)
             }
-            CompiledOp::Return => {
+            OptimizedOp::Return => {
                 let value = machine.calls.pop().ok_or(MachineError::CallStackEmpty)?;
                 match value {
                     MachineValue::ReturnAddress(target) => Some(target),
                     _ => return Err(MachineError::InstructionExpected),
                 }
             }
-            CompiledOp::Exit => None,
-            CompiledOp::CountLeadingZeros => {
+            OptimizedOp::Exit => None,
+            OptimizedOp::CountLeadingZeros => {
                 let value = machine.pop()?;
                 machine.push(value.leading_zeros());
                 Some(pc + 1)
             }
-            CompiledOp::CountLeadingOnes => {
+            OptimizedOp::CountLeadingOnes => {
                 let value = machine.pop()?;
                 machine.push(value.leading_ones());
                 Some(pc + 1)
             }
-            CompiledOp::CountTrailingZeros => {
+            OptimizedOp::CountTrailingZeros => {
                 let value = machine.pop()?;
                 machine.push(value.trailing_zeros());
                 Some(pc + 1)
             }
-            CompiledOp::CountTrailingOnes => {
+            OptimizedOp::CountTrailingOnes => {
                 let value = machine.pop()?;
                 machine.push(value.trailing_ones());
                 Some(pc + 1)
             }
-            CompiledOp::Binary {
+            OptimizedOp::Binary {
                 kind,
                 lhs,
                 rhs,
@@ -327,19 +327,19 @@ impl CompiledOp {
                 machine.bank.set(dst, result);
                 Some(pc + 1)
             }
-            CompiledOp::Copy { src, dst } => {
+            OptimizedOp::Copy { src, dst } => {
                 let value = src.resolve(&machine.bank);
                 machine.bank.set(dst, value);
                 Some(pc + 1)
             }
-            CompiledOp::JumpIfEqualValues { lhs, rhs, target } => {
+            OptimizedOp::JumpIfEqualValues { lhs, rhs, target } => {
                 if rhs.resolve(&machine.bank) == lhs.resolve(&machine.bank) {
                     Some(target)
                 } else {
                     Some(pc + 1)
                 }
             }
-            CompiledOp::JumpIfZeroValue { src, target } => {
+            OptimizedOp::JumpIfZeroValue { src, target } => {
                 if src.resolve(&machine.bank).is_zero() {
                     Some(target)
                 } else {
@@ -358,11 +358,11 @@ fn instruction_target(op: &Op) -> Result<usize> {
 }
 
 #[derive(Clone, Debug)]
-pub struct CompiledProgram {
-    ops: Vec<CompiledOp>,
+pub struct OptimizedProgram {
+    ops: Vec<OptimizedOp>,
 }
 
-impl CompiledProgram {
+impl OptimizedProgram {
     pub fn compile(program: &RawProgram) -> Result<Self> {
         let source = program.ops();
 
@@ -385,9 +385,9 @@ impl CompiledProgram {
         let mut map = vec![0; source.len()];
         let mut index = 0;
         while index < source.len() {
-            let (op, length) = match CompiledOp::fuse(&source[index..], &targets[index..]) {
+            let (op, length) = match OptimizedOp::fuse(&source[index..], &targets[index..]) {
                 Some(fused) => fused,
-                None => (CompiledOp::compile(&source[index])?, 1),
+                None => (OptimizedOp::compile(&source[index])?, 1),
             };
             for offset in 0..length {
                 map[index + offset] = ops.len();
@@ -410,7 +410,7 @@ impl CompiledProgram {
         Ok(Self { ops })
     }
 
-    pub fn ops(&self) -> &[CompiledOp] {
+    pub fn ops(&self) -> &[OptimizedOp] {
         &self.ops
     }
 }

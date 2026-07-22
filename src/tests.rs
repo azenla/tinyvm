@@ -3,3 +3,4 @@ pub mod encoding;
 pub mod execution;
 pub mod fib;
 pub mod fusion;
+pub mod jit;

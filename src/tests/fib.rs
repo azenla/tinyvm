@@ -1,5 +1,5 @@
-use crate::machine::compiled::CompiledProgram;
 use crate::machine::ops::OpHandlerSet;
+use crate::machine::optimized::OptimizedProgram;
 use crate::machine::value::MachineValue;
 use crate::machine::{Machine, MachineProgram, ops};
 use crate::program::RawProgram;
@@ -44,9 +44,23 @@ fn runs_inlined() {
 }
 
 #[test]
-fn runs_compiled() {
-    let compiled = CompiledProgram::compile(&constants::FIB_PROGRAM).unwrap();
-    let program = MachineProgram::Compiled(compiled);
+fn runs_optimized() {
+    let optimized = OptimizedProgram::compile(&constants::FIB_PROGRAM).unwrap();
+    let program = MachineProgram::Optimized(optimized);
+    let value = run_fib_program(ops::all(), program);
+    assert_eq!(value, MachineValue::Uint64(832040));
+}
+
+#[cfg(all(
+    any(unix, windows),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn runs_jit() {
+    use crate::machine::jit::JitProgram;
+
+    let optimized = OptimizedProgram::compile(&constants::FIB_PROGRAM).unwrap();
+    let program = MachineProgram::Jit(JitProgram::compile(&optimized).unwrap());
     let value = run_fib_program(ops::all(), program);
     assert_eq!(value, MachineValue::Uint64(832040));
 }
