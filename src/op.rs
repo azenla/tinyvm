@@ -70,6 +70,21 @@ pub enum OpArg {
 }
 
 impl OpArg {
+    pub fn register_index(&self) -> Option<usize> {
+        match self {
+            OpArg::Register1 => Some(0),
+            OpArg::Register2 => Some(1),
+            OpArg::Register3 => Some(2),
+            OpArg::Register4 => Some(3),
+            OpArg::Register5 => Some(4),
+            OpArg::Register6 => Some(5),
+            OpArg::Register7 => Some(6),
+            OpArg::Register8 => Some(7),
+            OpArg::Register9 => Some(8),
+            _ => None,
+        }
+    }
+
     pub fn is_register(&self) -> bool {
         matches!(
             self,

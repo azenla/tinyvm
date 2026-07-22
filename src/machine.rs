@@ -1,3 +1,4 @@
+use crate::machine::compiled::CompiledProgram;
 use crate::machine::error::{MachineError, Result};
 use crate::machine::ops::{InlinedOpHandlers, OpHandlerSet};
 use crate::machine::registers::RegisterBank;
@@ -5,6 +6,7 @@ use crate::machine::value::MachineValue;
 use crate::op::{Op, OpArg};
 use crate::program::RawProgram;
 
+pub mod compiled;
 pub mod error;
 pub mod ops;
 pub mod registers;
@@ -21,6 +23,7 @@ pub enum MachineLoopState {
 pub enum MachineProgram<'program> {
     Uncompiled(&'program RawProgram<'program>),
     Inlined(InlinedOpHandlers<'program>),
+    Compiled(CompiledProgram),
 }
 
 #[derive(Clone, Default)]
@@ -126,11 +129,48 @@ impl Machine {
         self.step_shared(result)
     }
 
+    pub fn step_compiled(&mut self, program: &CompiledProgram) -> Result<MachineLoopState> {
+        let pc = self.state.current;
+        let op = program
+            .ops()
+            .get(pc)
+            .ok_or(MachineError::InstructionOverflow)?;
+        match op.perform(&mut self.state, pc)? {
+            Some(next) => {
+                self.state.current = next;
+                if next == pc + 1 {
+                    Ok(MachineLoopState::Next)
+                } else {
+                    Ok(MachineLoopState::Stay)
+                }
+            }
+            None => Ok(MachineLoopState::Break),
+        }
+    }
+
     pub fn step(&mut self, program: &MachineProgram) -> Result<MachineLoopState> {
         match program {
             MachineProgram::Uncompiled(program) => self.step_uncompiled(program),
             MachineProgram::Inlined(program) => self.step_inlined(program),
+            MachineProgram::Compiled(program) => self.step_compiled(program),
         }
+    }
+
+    fn run_compiled(&mut self, program: &CompiledProgram) -> Result<()> {
+        let ops = program.ops();
+        let mut pc = self.state.current;
+        let result = loop {
+            let Some(op) = ops.get(pc) else {
+                break Err(MachineError::InstructionOverflow);
+            };
+            match op.perform(&mut self.state, pc) {
+                Ok(Some(next)) => pc = next,
+                Ok(None) => break Ok(()),
+                Err(error) => break Err(error),
+            }
+        };
+        self.state.current = pc;
+        result
     }
 
     pub fn run(&mut self, program: &MachineProgram) -> Result<()> {
@@ -148,6 +188,8 @@ impl Machine {
                     break;
                 }
             },
+
+            MachineProgram::Compiled(program) => return self.run_compiled(program),
         }
 
         Ok(())

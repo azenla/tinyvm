@@ -1,5 +1,6 @@
 use std::str::FromStr;
 use std::time::Instant;
+use tinyvm::machine::compiled::CompiledProgram;
 use tinyvm::machine::value::MachineValue;
 use tinyvm::machine::{Machine, MachineProgram, ops};
 use tinyvm::program::RawProgram;
@@ -33,6 +34,10 @@ fn main() {
         (
             "inlined",
             MachineProgram::Inlined(ops::all().inline(&program).unwrap()),
+        ),
+        (
+            "compiled",
+            MachineProgram::Compiled(CompiledProgram::compile(&program).unwrap()),
         ),
     ];
 

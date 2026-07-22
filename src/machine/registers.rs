@@ -18,6 +18,14 @@ impl RegisterBank {
         self.registers = [MachineValue::None; REGISTER_BANK_COUNT];
     }
 
+    pub fn get(&self, index: usize) -> MachineValue {
+        self.registers[index]
+    }
+
+    pub fn set(&mut self, index: usize, value: MachineValue) {
+        self.registers[index] = value;
+    }
+
     pub fn load(&self, arg: OpArg) -> Option<MachineValue> {
         match arg {
             OpArg::Register1 => Some(self.registers[0]),

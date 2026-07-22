@@ -1,3 +1,4 @@
+use crate::machine::compiled::CompiledProgram;
 use crate::machine::ops::OpHandlerSet;
 use crate::machine::value::MachineValue;
 use crate::machine::{Machine, MachineProgram, ops};
@@ -39,5 +40,12 @@ fn returns_to_instruction_after_call_inlined() {
     let ops = ops::all();
     let inlined = ops.inline(&CALL_PROGRAM).unwrap();
     let program = MachineProgram::Inlined(inlined);
+    assert_eq!(run(ops::all(), program), MachineValue::Uint64(99));
+}
+
+#[test]
+fn returns_to_instruction_after_call_compiled() {
+    let compiled = CompiledProgram::compile(&CALL_PROGRAM).unwrap();
+    let program = MachineProgram::Compiled(compiled);
     assert_eq!(run(ops::all(), program), MachineValue::Uint64(99));
 }

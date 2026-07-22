@@ -1,3 +1,4 @@
+use crate::machine::compiled::CompiledProgram;
 use crate::machine::ops::OpHandlerSet;
 use crate::machine::value::MachineValue;
 use crate::machine::{Machine, MachineProgram, ops};
@@ -38,6 +39,14 @@ fn runs_inlined() {
     let ops = ops::all();
     let inlined = ops.inline(&constants::FIB_PROGRAM).unwrap();
     let program = MachineProgram::Inlined(inlined);
+    let value = run_fib_program(ops::all(), program);
+    assert_eq!(value, MachineValue::Uint64(832040));
+}
+
+#[test]
+fn runs_compiled() {
+    let compiled = CompiledProgram::compile(&constants::FIB_PROGRAM).unwrap();
+    let program = MachineProgram::Compiled(compiled);
     let value = run_fib_program(ops::all(), program);
     assert_eq!(value, MachineValue::Uint64(832040));
 }
