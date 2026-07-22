@@ -16,9 +16,11 @@ fn bench(label: &str, mut run: impl FnMut()) {
     }
     let elapsed = start.elapsed();
     let ops = (OPS_PER_RUN * RUNS as u64) as f64;
+    let secs = elapsed.as_secs_f64();
     println!(
-        "{label:<12} {:>7.1} M ops/s  ({elapsed:?})",
-        ops / elapsed.as_secs_f64() / 1e6
+        "{label:<12} {:>7.1} M ops/s  {:>8.1} runs/s  ({elapsed:?})",
+        ops / secs / 1e6,
+        RUNS as f64 / secs
     );
 }
 
