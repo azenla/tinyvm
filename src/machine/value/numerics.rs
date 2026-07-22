@@ -211,38 +211,46 @@ impl MachineValue {
     }
 }
 
-macro_rules! perform_infix_op {
-    ($left:expr, $right:expr, $op:tt) => {
+macro_rules! perform_function_op {
+    ($left:expr, $right:expr, $op:ident) => {
         match ($left, $right) {
             (MachineValue::Uint32(lhs), MachineValue::Uint32(rhs)) => {
-                MachineValue::Uint32(lhs $op rhs)
+                MachineValue::Uint32(lhs.$op(rhs))
             }
             (MachineValue::Uint64(lhs), MachineValue::Uint64(rhs)) => {
-                MachineValue::Uint64(lhs $op rhs)
+                MachineValue::Uint64(lhs.$op(rhs))
             }
-            (MachineValue::Int32(lhs), MachineValue::Int32(rhs)) => MachineValue::Int32(lhs $op rhs),
-            (MachineValue::Int64(lhs), MachineValue::Int64(rhs)) => MachineValue::Int64(lhs $op rhs),
+            (MachineValue::Int32(lhs), MachineValue::Int32(rhs)) => {
+                MachineValue::Int32(lhs.$op(rhs))
+            }
+            (MachineValue::Int64(lhs), MachineValue::Int64(rhs)) => {
+                MachineValue::Int64(lhs.$op(rhs))
+            }
 
-            (MachineValue::Uint8(lhs), MachineValue::Uint8(rhs)) => MachineValue::Uint8(lhs $op rhs),
+            (MachineValue::Uint8(lhs), MachineValue::Uint8(rhs)) => {
+                MachineValue::Uint8(lhs.$op(rhs))
+            }
             (MachineValue::Uint16(lhs), MachineValue::Uint16(rhs)) => {
-                MachineValue::Uint16(lhs $op rhs)
+                MachineValue::Uint16(lhs.$op(rhs))
             }
 
-            (MachineValue::Int8(lhs), MachineValue::Int8(rhs)) => MachineValue::Int8(lhs $op rhs),
-            (MachineValue::Int16(lhs), MachineValue::Int16(rhs)) => MachineValue::Int16(lhs $op rhs),
+            (MachineValue::Int8(lhs), MachineValue::Int8(rhs)) => MachineValue::Int8(lhs.$op(rhs)),
+            (MachineValue::Int16(lhs), MachineValue::Int16(rhs)) => {
+                MachineValue::Int16(lhs.$op(rhs))
+            }
             _ => match $left {
-                MachineValue::Uint32(lhs) => MachineValue::Uint32(lhs $op $right.as_u32()),
-                MachineValue::Uint64(lhs) => MachineValue::Uint64(lhs $op $right.as_u64()),
-                MachineValue::Int32(lhs) => MachineValue::Int32(lhs $op $right.as_i32()),
-                MachineValue::Int64(lhs) => MachineValue::Int64(lhs $op $right.as_i64()),
+                MachineValue::Uint32(lhs) => MachineValue::Uint32(lhs.$op($right.as_u32())),
+                MachineValue::Uint64(lhs) => MachineValue::Uint64(lhs.$op($right.as_u64())),
+                MachineValue::Int32(lhs) => MachineValue::Int32(lhs.$op($right.as_i32())),
+                MachineValue::Int64(lhs) => MachineValue::Int64(lhs.$op($right.as_i64())),
 
                 MachineValue::None => MachineValue::None,
-                MachineValue::Uint8(lhs) => MachineValue::Uint8(lhs $op $right.as_u8()),
-                MachineValue::Uint16(lhs) => MachineValue::Uint16(lhs $op $right.as_u16()),
-                MachineValue::Int8(lhs) => MachineValue::Int8(lhs $op $right.as_i8()),
-                MachineValue::Int16(lhs) => MachineValue::Int16(lhs $op $right.as_i16()),
+                MachineValue::Uint8(lhs) => MachineValue::Uint8(lhs.$op($right.as_u8())),
+                MachineValue::Uint16(lhs) => MachineValue::Uint16(lhs.$op($right.as_u16())),
+                MachineValue::Int8(lhs) => MachineValue::Int8(lhs.$op($right.as_i8())),
+                MachineValue::Int16(lhs) => MachineValue::Int16(lhs.$op($right.as_i16())),
                 MachineValue::ReturnAddress(lhs) => {
-                    MachineValue::ReturnAddress(lhs $op $right.as_u64() as usize)
+                    MachineValue::ReturnAddress(lhs.$op($right.as_u64() as usize))
                 }
             },
         }
@@ -253,7 +261,7 @@ impl Add for MachineValue {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        perform_infix_op!(self, rhs, +)
+        perform_function_op!(self, rhs, wrapping_add)
     }
 }
 
@@ -261,7 +269,7 @@ impl Sub for MachineValue {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
-        perform_infix_op!(self, rhs, -)
+        perform_function_op!(self, rhs, wrapping_sub)
     }
 }
 
@@ -269,7 +277,7 @@ impl Mul for MachineValue {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        perform_infix_op!(self, rhs, *)
+        perform_function_op!(self, rhs, wrapping_mul)
     }
 }
 
@@ -277,7 +285,7 @@ impl Div for MachineValue {
     type Output = Self;
 
     fn div(self, rhs: Self) -> Self::Output {
-        perform_infix_op!(self, rhs, /)
+        perform_function_op!(self, rhs, wrapping_div)
     }
 }
 
@@ -285,7 +293,7 @@ impl Rem for MachineValue {
     type Output = Self;
 
     fn rem(self, rhs: Self) -> Self::Output {
-        perform_infix_op!(self, rhs, %)
+        perform_function_op!(self, rhs, wrapping_rem)
     }
 }
 
