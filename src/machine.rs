@@ -113,7 +113,7 @@ impl Machine {
             .handlers
             .get(&op.code)
             .ok_or(MachineError::InvalidOpCode)?;
-        let result = handler.perform(&mut self.state, op);
+        let result = handler(&mut self.state, op);
         self.step_shared(result)
     }
 
@@ -122,7 +122,7 @@ impl Machine {
             .ops()
             .get(self.state.current)
             .ok_or(MachineError::InstructionOverflow)?;
-        let result = handler.perform(&mut self.state, op);
+        let result = handler(&mut self.state, op);
         self.step_shared(result)
     }
 

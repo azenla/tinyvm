@@ -3,27 +3,29 @@ use crate::machine::ops::OpHandler;
 use crate::machine::{MachineLoopState, MachineState};
 use crate::op::{Op, OpCode};
 
+#[derive(Default)]
 pub struct JumpOp;
 
 impl OpHandler for JumpOp {
-    fn code(&self) -> OpCode {
+    fn code() -> OpCode {
         OpCode::Jump
     }
 
-    fn perform(&self, machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
+    fn perform(machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
         machine.jmp(op)?;
         Ok(MachineLoopState::Stay)
     }
 }
 
+#[derive(Default)]
 pub struct JumpIfEqualOp;
 
 impl OpHandler for JumpIfEqualOp {
-    fn code(&self) -> OpCode {
+    fn code() -> OpCode {
         OpCode::JumpIfEqual
     }
 
-    fn perform(&self, machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
+    fn perform(machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
         let value1 = machine.pop()?;
         let value2 = machine.pop()?;
         if value1 == value2 {
@@ -34,14 +36,15 @@ impl OpHandler for JumpIfEqualOp {
     }
 }
 
+#[derive(Default)]
 pub struct JumpIfZeroOp;
 
 impl OpHandler for JumpIfZeroOp {
-    fn code(&self) -> OpCode {
+    fn code() -> OpCode {
         OpCode::JumpIfZero
     }
 
-    fn perform(&self, machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
+    fn perform(machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
         let value = machine.pop()?;
         if value.is_zero() {
             machine.jmp(op)?;
@@ -51,39 +54,42 @@ impl OpHandler for JumpIfZeroOp {
     }
 }
 
+#[derive(Default)]
 pub struct ExitOp;
 
 impl OpHandler for ExitOp {
-    fn code(&self) -> OpCode {
+    fn code() -> OpCode {
         OpCode::Exit
     }
 
-    fn perform(&self, _machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
+    fn perform(_machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         Ok(MachineLoopState::Break)
     }
 }
 
+#[derive(Default)]
 pub struct CallOp;
 
 impl OpHandler for CallOp {
-    fn code(&self) -> OpCode {
+    fn code() -> OpCode {
         OpCode::Call
     }
 
-    fn perform(&self, machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
+    fn perform(machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
         machine.call(op)?;
         Ok(MachineLoopState::Stay)
     }
 }
 
+#[derive(Default)]
 pub struct ReturnOp;
 
 impl OpHandler for ReturnOp {
-    fn code(&self) -> OpCode {
+    fn code() -> OpCode {
         OpCode::Return
     }
 
-    fn perform(&self, machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
+    fn perform(machine: &mut MachineState, _op: &Op) -> Result<MachineLoopState> {
         machine.ret()?;
         Ok(MachineLoopState::Stay)
     }

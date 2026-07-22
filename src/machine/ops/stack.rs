@@ -5,28 +5,30 @@ use crate::machine::value::MachineValue;
 use crate::machine::{MachineLoopState, MachineState};
 use crate::op::{Op, OpCode};
 
+#[derive(Default)]
 pub struct PushOp;
 
 impl OpHandler for PushOp {
-    fn code(&self) -> OpCode {
+    fn code() -> OpCode {
         OpCode::Push
     }
 
-    fn perform(&self, machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
+    fn perform(machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
         let value = MachineValue::of(op.arg, &machine.bank).ok_or(MachineError::ValueExpected)?;
         machine.push(value);
         Ok(MachineLoopState::Next)
     }
 }
 
+#[derive(Default)]
 pub struct PopOp;
 
 impl OpHandler for PopOp {
-    fn code(&self) -> OpCode {
+    fn code() -> OpCode {
         OpCode::Pop
     }
 
-    fn perform(&self, machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
+    fn perform(machine: &mut MachineState, op: &Op) -> Result<MachineLoopState> {
         let value = machine.pop()?;
         machine.bank.store(op.arg, value)?;
         Ok(MachineLoopState::Next)
