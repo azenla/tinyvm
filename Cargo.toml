@@ -10,6 +10,16 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 
+[profile.release-debuginfo]
+inherits = "release"
+strip = "none"
+debug = 1
+
+[profile.dev-fast]
+inherits = "dev"
+strip = "debuginfo"
+debug = 0
+
 [lib]
 name = "tinyvm"
 path = "src/lib.rs"
