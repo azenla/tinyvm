@@ -14,6 +14,7 @@ pub enum MachineError {
     InvalidOpCode,
     MemoryUnavailable,
     StepUnsupported,
+    InputMismatch,
 }
 
 impl Display for MachineError {
@@ -28,6 +29,7 @@ impl Display for MachineError {
             MachineError::InvalidOpCode => write!(f, "invalid opcode"),
             MachineError::MemoryUnavailable => write!(f, "memory unavailable"),
             MachineError::StepUnsupported => write!(f, "step unsupported"),
+            MachineError::InputMismatch => write!(f, "input mismatch"),
         }
     }
 }

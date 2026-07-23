@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::time::Instant;
 use tinyvm::machine::intermediate::IntermediateProgram;
-use tinyvm::machine::optimizer::OptimizedProgram;
+use tinyvm::machine::optimizer::{OptimizedProgram, ValueType};
 use tinyvm::machine::value::MachineValue;
 use tinyvm::machine::{Machine, MachineProgram, ops};
 use tinyvm::program::RawProgram;
@@ -34,7 +34,7 @@ fn main() {
     let program = RawProgram::from_str(&text).unwrap();
 
     let intermediate = IntermediateProgram::compile(&program).unwrap();
-    let optimized = OptimizedProgram::compile(&intermediate);
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
 
     let mut modes = vec![
         ("uncompiled", "ops", MachineProgram::Uncompiled(&program)),

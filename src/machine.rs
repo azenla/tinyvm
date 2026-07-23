@@ -6,7 +6,7 @@ use crate::machine::intermediate::{IntermediateOp, IntermediateProgram};
 ))]
 use crate::machine::jit::JitProgram;
 use crate::machine::ops::{InlinedOpHandlers, OpHandlerSet};
-use crate::machine::optimizer::OptimizedProgram;
+use crate::machine::optimizer::{OptimizedProgram, ValueType};
 use crate::machine::registers::RegisterBank;
 use crate::machine::value::MachineValue;
 use crate::op::{Op, OpArg};
@@ -100,6 +100,26 @@ impl MachineState {
 
     pub fn bank(&self) -> &RegisterBank {
         &self.bank
+    }
+
+    /// Optimized programs may declare the types the caller pushes before
+    /// running; type-specialized code trusts the declaration, so entering at
+    /// instruction zero verifies it against the actual stack. Resuming at
+    /// any other program counter skips the check, since execution already
+    /// passed it on the way in.
+    pub(crate) fn check_inputs(&self, inputs: &[ValueType]) -> Result<()> {
+        if self.current != 0 || inputs.is_empty() {
+            return Ok(());
+        }
+        let Some(start) = self.stack.len().checked_sub(inputs.len()) else {
+            return Err(MachineError::InputMismatch);
+        };
+        for (value, expected) in self.stack[start..].iter().zip(inputs) {
+            if *expected != ValueType::Unknown && ValueType::of(value) != *expected {
+                return Err(MachineError::InputMismatch);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -219,7 +239,10 @@ impl Machine {
 
             MachineProgram::Intermediate(program) => return self.run_ops(program.ops()),
 
-            MachineProgram::Optimized(program) => return self.run_ops(program.ops()),
+            MachineProgram::Optimized(program) => {
+                self.state.check_inputs(program.inputs())?;
+                return self.run_ops(program.ops());
+            }
 
             #[cfg(all(
                 any(unix, windows),

@@ -1,3 +1,4 @@
+use crate::machine::error::MachineError;
 use crate::machine::intermediate::{IntermediateOp, IntermediateProgram};
 use crate::machine::optimizer::{OptimizedProgram, ValueType};
 use crate::machine::value::MachineValue;
@@ -185,6 +186,87 @@ fn division_by_constant_zero_is_not_folded() {
             .iter()
             .any(|op| matches!(op, IntermediateOp::Binary { .. }))
     );
+}
+
+// Without a declaration the popped input is untypeable; with one, the type
+// flows through the abstract stack into the register.
+#[test]
+fn declared_inputs_type_popped_values() {
+    static PROGRAM: RawProgram = program!(op!(Pop, Register1), op!(Push, Register1), op!(Exit),);
+
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
+    let untyped = OptimizedProgram::compile(&intermediate);
+    assert_eq!(untyped.types()[1].get(0), ValueType::Unknown);
+
+    let typed = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
+    assert_eq!(typed.types()[1].get(0), ValueType::Uint64);
+}
+
+// The declaration is a contract the analysis trusted, so running with the
+// wrong type on the stack — or nothing at all — must fail up front rather
+// than let type-specialized code read the wrong payloads.
+#[test]
+fn rejects_undeclared_inputs() {
+    static PROGRAM: RawProgram = program!(op!(Pop, Register1), op!(Push, Register1), op!(Exit),);
+
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
+    let program = MachineProgram::Optimized(optimized.clone());
+
+    let mut machine = Machine::new(ops::all());
+    machine.state().push(MachineValue::Uint32(5));
+    let error = machine.run(&program).unwrap_err();
+    assert_eq!(error, MachineError::InputMismatch);
+
+    let mut machine = Machine::new(ops::all());
+    let error = machine.run(&program).unwrap_err();
+    assert_eq!(error, MachineError::InputMismatch);
+
+    let mut machine = Machine::new(ops::all());
+    machine.state().push(MachineValue::Uint64(5));
+    machine.run(&program).unwrap();
+    assert_eq!(machine.state().pop().unwrap(), MachineValue::Uint64(5));
+
+    #[cfg(all(
+        any(unix, windows),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    {
+        use crate::machine::jit::JitProgram;
+
+        let jit = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
+        let mut machine = Machine::new(ops::all());
+        machine.state().push(MachineValue::Uint32(5));
+        assert_eq!(machine.run(&jit).unwrap_err(), MachineError::InputMismatch);
+
+        let mut machine = Machine::new(ops::all());
+        machine.state().push(MachineValue::Uint64(5));
+        machine.run(&jit).unwrap();
+        assert_eq!(machine.state().pop().unwrap(), MachineValue::Uint64(5));
+    }
+}
+
+// Both branches push a `Uint64` before the join, so the pop after it is
+// typed even though fusion could not see across the jump target.
+#[test]
+fn stack_types_survive_branch_joins() {
+    static PROGRAM: RawProgram = program!(
+        op!(Push, Register1),
+        op!(JumpIfZero, Instruction(4)),
+        op!(Push, Uint64(7)),
+        op!(Jump, Instruction(5)),
+        op!(Push, Uint64(9)),
+        op!(Pop, Register2),
+        op!(Push, Register2),
+        op!(Exit),
+    );
+
+    // Fusion leaves the pop at op index 4, after the branch join, and the
+    // push of the popped register at index 5.
+    let optimized = optimize(&PROGRAM);
+    assert_eq!(optimized.types()[5].get(1), ValueType::Uint64);
+    assert_eq!(run_uncompiled(&PROGRAM), MachineValue::Uint64(9));
+    assert_eq!(run_optimized(&PROGRAM), MachineValue::Uint64(9));
 }
 
 #[test]

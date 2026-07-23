@@ -53,10 +53,11 @@ fn runs_intermediate() {
 
 #[test]
 fn runs_optimized() {
-    use crate::machine::optimizer::OptimizedProgram;
+    use crate::machine::optimizer::{OptimizedProgram, ValueType};
 
     let intermediate = IntermediateProgram::compile(&constants::FIB_PROGRAM).unwrap();
-    let program = MachineProgram::Optimized(OptimizedProgram::compile(&intermediate));
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
+    let program = MachineProgram::Optimized(optimized);
     let value = run_fib_program(ops::all(), program);
     assert_eq!(value, MachineValue::Uint64(832040));
 }
@@ -82,10 +83,10 @@ fn runs_jit() {
 #[test]
 fn runs_jit_optimized() {
     use crate::machine::jit::JitProgram;
-    use crate::machine::optimizer::OptimizedProgram;
+    use crate::machine::optimizer::{OptimizedProgram, ValueType};
 
     let intermediate = IntermediateProgram::compile(&constants::FIB_PROGRAM).unwrap();
-    let optimized = OptimizedProgram::compile(&intermediate);
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
     let program = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
     let value = run_fib_program(ops::all(), program);
     assert_eq!(value, MachineValue::Uint64(832040));

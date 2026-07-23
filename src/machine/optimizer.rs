@@ -44,7 +44,7 @@ impl ValueType {
     }
 }
 
-/// What the analysis knows about one register at one point in the program:
+/// What the analysis knows about one value at one point in the program:
 /// nothing, its type, or its exact value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Fact {
@@ -89,32 +89,61 @@ impl Fact {
     }
 }
 
-/// Facts about every register on entry to one op.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct RegisterFacts {
-    facts: [Fact; REGISTER_BANK_COUNT],
+/// Facts about the machine on entry to one op: every register, and the top
+/// of the value stack from `stack[0]` (deepest known) to the last element
+/// (top). Anything beneath the known entries is unknown, since callers may
+/// enter with more values than a program's declared inputs.
+#[derive(Clone, Debug, PartialEq)]
+struct Facts {
+    registers: [Fact; REGISTER_BANK_COUNT],
+    stack: Vec<Fact>,
 }
 
-impl RegisterFacts {
-    fn unknown() -> RegisterFacts {
-        Self {
-            facts: [Fact::Unknown; REGISTER_BANK_COUNT],
+impl Facts {
+    fn entry(inputs: &[ValueType]) -> Facts {
+        Facts {
+            registers: [Fact::Unknown; REGISTER_BANK_COUNT],
+            stack: inputs.iter().map(|input| Fact::of_type(*input)).collect(),
         }
     }
 
-    fn merge(&self, other: &RegisterFacts) -> RegisterFacts {
-        let mut merged = *self;
-        for (fact, other) in merged.facts.iter_mut().zip(&other.facts) {
+    fn unknown() -> Facts {
+        Self::entry(&[])
+    }
+
+    fn merge(&self, other: &Facts) -> Facts {
+        let mut registers = self.registers;
+        for (fact, other) in registers.iter_mut().zip(&other.registers) {
             *fact = fact.merge(*other);
         }
-        merged
+
+        // Stacks align at the top; whatever only one side knows about the
+        // deeper entries is discarded.
+        let depth = self.stack.len().min(other.stack.len());
+        let lhs = &self.stack[self.stack.len() - depth..];
+        let rhs = &other.stack[other.stack.len() - depth..];
+        let stack = lhs
+            .iter()
+            .zip(rhs)
+            .map(|(fact, other)| fact.merge(*other))
+            .collect();
+
+        Facts { registers, stack }
     }
 
     fn of_source(&self, source: &Source) -> Fact {
         match source {
-            Source::Register(index) => self.facts[*index],
+            Source::Register(index) => self.registers[*index],
             Source::Value(value) => Fact::Constant(*value),
         }
+    }
+
+    fn push(&mut self, fact: Fact) {
+        self.stack.push(fact);
+    }
+
+    fn pop(&mut self) -> Fact {
+        self.stack.pop().unwrap_or(Fact::Unknown)
     }
 }
 
@@ -127,9 +156,9 @@ pub struct RegisterTypes {
 }
 
 impl RegisterTypes {
-    fn of(facts: &RegisterFacts) -> RegisterTypes {
+    fn of(facts: &Facts) -> RegisterTypes {
         let mut types = [ValueType::Unknown; REGISTER_BANK_COUNT];
-        for (value_type, fact) in types.iter_mut().zip(&facts.facts) {
+        for (value_type, fact) in types.iter_mut().zip(&facts.registers) {
             *value_type = fact.value_type();
         }
         RegisterTypes { types }
@@ -161,9 +190,60 @@ fn binary_fact(kind: BinaryOpKind, lhs: Fact, rhs: Fact) -> Fact {
     Fact::of_type(lhs.value_type())
 }
 
-fn transfer(op: &IntermediateOp, facts: &mut RegisterFacts) {
+/// Count ops produce a `Uint32` for any numeric input and `None` for `None`.
+fn count_fact(input: Fact) -> Fact {
+    match input.value_type() {
+        ValueType::Unknown => Fact::Unknown,
+        ValueType::None => Fact::Typed(ValueType::None),
+        _ => Fact::Typed(ValueType::Uint32),
+    }
+}
+
+fn stack_kind(op: &IntermediateOp) -> Option<BinaryOpKind> {
+    Some(match op {
+        IntermediateOp::Add => BinaryOpKind::Add,
+        IntermediateOp::Subtract => BinaryOpKind::Subtract,
+        IntermediateOp::Multiply => BinaryOpKind::Multiply,
+        IntermediateOp::Divide => BinaryOpKind::Divide,
+        IntermediateOp::Remainder => BinaryOpKind::Remainder,
+        _ => return None,
+    })
+}
+
+fn transfer(op: &IntermediateOp, facts: &mut Facts) {
+    if let Some(kind) = stack_kind(op) {
+        // The interpreter pops the right operand first and coerces it to the
+        // second pop's type.
+        let rhs = facts.pop();
+        let lhs = facts.pop();
+        facts.push(binary_fact(kind, lhs, rhs));
+        return;
+    }
+
     match op {
-        IntermediateOp::PopRegister(index) => facts.facts[*index] = Fact::Unknown,
+        IntermediateOp::PushValue(value) => facts.push(Fact::Constant(*value)),
+        IntermediateOp::PushRegister(index) => {
+            let fact = facts.registers[*index];
+            facts.push(fact);
+        }
+        IntermediateOp::PopRegister(index) => {
+            let fact = facts.pop();
+            facts.registers[*index] = fact;
+        }
+        IntermediateOp::CountLeadingZeros
+        | IntermediateOp::CountLeadingOnes
+        | IntermediateOp::CountTrailingZeros
+        | IntermediateOp::CountTrailingOnes => {
+            let fact = count_fact(facts.pop());
+            facts.push(fact);
+        }
+        IntermediateOp::JumpIfEqual(_) => {
+            facts.pop();
+            facts.pop();
+        }
+        IntermediateOp::JumpIfZero(_) => {
+            facts.pop();
+        }
         IntermediateOp::Binary {
             kind,
             lhs,
@@ -171,11 +251,11 @@ fn transfer(op: &IntermediateOp, facts: &mut RegisterFacts) {
             dst,
         } => {
             let fact = binary_fact(*kind, facts.of_source(lhs), facts.of_source(rhs));
-            facts.facts[*dst] = fact;
+            facts.registers[*dst] = fact;
         }
         IntermediateOp::Copy { src, dst } => {
             let fact = facts.of_source(src);
-            facts.facts[*dst] = fact;
+            facts.registers[*dst] = fact;
         }
         _ => {}
     }
@@ -196,41 +276,44 @@ fn successors(op: &IntermediateOp, pc: usize) -> [Option<usize>; 2] {
     }
 }
 
-/// Register facts on entry to every op, or `None` for ops the analysis never
-/// reached. Facts flow forward from instruction zero to a fixpoint; a jump
-/// target holds the merge of every predecessor's facts, and nothing is known
-/// on entry to the program or at the op a `Return` resumes.
-fn analyze(ops: &[IntermediateOp]) -> Vec<Option<RegisterFacts>> {
-    let mut inputs: Vec<Option<RegisterFacts>> = vec![None; ops.len()];
-    let Some(first) = inputs.first_mut() else {
-        return inputs;
+/// Facts on entry to every op, or `None` for ops the analysis never reached.
+/// Facts flow forward from instruction zero to a fixpoint; a jump target
+/// holds the merge of every predecessor's facts. On entry to the program the
+/// stack holds the declared input types and every register is unknown, and
+/// nothing at all is known at the op a `Return` resumes.
+fn analyze(ops: &[IntermediateOp], inputs: &[ValueType]) -> Vec<Option<Facts>> {
+    let mut entries: Vec<Option<Facts>> = vec![None; ops.len()];
+    let Some(first) = entries.first_mut() else {
+        return entries;
     };
-    *first = Some(RegisterFacts::unknown());
+    *first = Some(Facts::entry(inputs));
 
     for (pc, op) in ops.iter().enumerate() {
         if matches!(op, IntermediateOp::Call(_))
-            && let Some(input) = inputs.get_mut(pc + 1)
+            && let Some(entry) = entries.get_mut(pc + 1)
         {
-            *input = Some(RegisterFacts::unknown());
+            *entry = Some(Facts::unknown());
         }
     }
 
     loop {
         let mut changed = false;
         for (pc, op) in ops.iter().enumerate() {
-            let Some(facts) = inputs[pc] else { continue };
-            let mut output = facts;
+            let Some(facts) = entries[pc].as_ref() else {
+                continue;
+            };
+            let mut output = facts.clone();
             transfer(op, &mut output);
             for successor in successors(op, pc).into_iter().flatten() {
-                let Some(input) = inputs.get_mut(successor) else {
+                let Some(entry) = entries.get_mut(successor) else {
                     continue;
                 };
-                let merged = match input {
+                let merged = match entry.as_ref() {
                     Some(existing) => existing.merge(&output),
-                    None => output,
+                    None => output.clone(),
                 };
-                if *input != Some(merged) {
-                    *input = Some(merged);
+                if entry.as_ref() != Some(&merged) {
+                    *entry = Some(merged);
                     changed = true;
                 }
             }
@@ -240,21 +323,21 @@ fn analyze(ops: &[IntermediateOp]) -> Vec<Option<RegisterFacts>> {
         }
     }
 
-    inputs
+    entries
 }
 
-fn propagate(source: &mut Source, facts: &RegisterFacts) {
+fn propagate(source: &mut Source, facts: &Facts) {
     if let Source::Register(index) = source
-        && let Some(value) = facts.facts[*index].constant()
+        && let Some(value) = facts.registers[*index].constant()
     {
         *source = Source::Value(value);
     }
 }
 
-fn substitute(op: &mut IntermediateOp, facts: &RegisterFacts) {
+fn substitute(op: &mut IntermediateOp, facts: &Facts) {
     match op {
         IntermediateOp::PushRegister(index) => {
-            if let Some(value) = facts.facts[*index].constant() {
+            if let Some(value) = facts.registers[*index].constant() {
                 *op = IntermediateOp::PushValue(value);
             }
         }
@@ -312,9 +395,9 @@ fn fold(op: IntermediateOp, pc: usize) -> IntermediateOp {
 /// hold, then folds ops whose operands all became constant: arithmetic into
 /// copies of the result, and conditional jumps into unconditional jumps —
 /// to the target when the condition holds, to the next op when it cannot.
-fn rewrite(ops: &mut [IntermediateOp], inputs: &[Option<RegisterFacts>]) {
+fn rewrite(ops: &mut [IntermediateOp], entries: &[Option<Facts>]) {
     for pc in 0..ops.len() {
-        let Some(facts) = &inputs[pc] else { continue };
+        let Some(facts) = &entries[pc] else { continue };
         let mut op = ops[pc];
         substitute(&mut op, facts);
         ops[pc] = fold(op, pc);
@@ -378,24 +461,37 @@ fn compact(ops: Vec<IntermediateOp>) -> Vec<IntermediateOp> {
 pub struct OptimizedProgram {
     ops: Vec<IntermediateOp>,
     types: Vec<RegisterTypes>,
+    inputs: Vec<ValueType>,
 }
 
 impl OptimizedProgram {
     pub fn compile(program: &IntermediateProgram) -> Self {
+        Self::compile_with_inputs(program, &[])
+    }
+
+    /// Compiles against a declared entry stack: `inputs` lists the types of
+    /// the values the caller pushes before running, deepest first. The
+    /// analysis trusts the declaration, so the machine verifies it against
+    /// the actual stack whenever execution enters at instruction zero.
+    pub fn compile_with_inputs(program: &IntermediateProgram, inputs: &[ValueType]) -> Self {
         let mut ops = program.ops().to_vec();
-        let inputs = analyze(&ops);
-        rewrite(&mut ops, &inputs);
+        let entries = analyze(&ops, inputs);
+        rewrite(&mut ops, &entries);
         thread(&mut ops);
         let ops = compact(ops);
 
         // The analysis runs again over the final ops so the recorded types
         // line up with the compacted indices.
-        let types = analyze(&ops)
+        let types = analyze(&ops, inputs)
             .into_iter()
             .map(|facts| facts.as_ref().map(RegisterTypes::of).unwrap_or_default())
             .collect();
 
-        Self { ops, types }
+        Self {
+            ops,
+            types,
+            inputs: inputs.to_vec(),
+        }
     }
 
     pub fn ops(&self) -> &[IntermediateOp] {
@@ -405,5 +501,10 @@ impl OptimizedProgram {
     /// The inferred register types on entry to every op, parallel to `ops`.
     pub fn types(&self) -> &[RegisterTypes] {
         &self.types
+    }
+
+    /// The declared types of the entry stack, deepest first.
+    pub fn inputs(&self) -> &[ValueType] {
+        &self.inputs
     }
 }

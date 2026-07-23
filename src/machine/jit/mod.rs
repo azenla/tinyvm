@@ -91,22 +91,29 @@ struct JitCode {
     /// Native code address of every op, indexed by instruction; also consulted
     /// by generated code to dispatch `Return` ops.
     entries: Box<[usize]>,
+    /// Declared entry stack types, verified before entering at instruction
+    /// zero: the generated code trusts them.
+    inputs: Box<[ValueType]>,
     /// Operand pool referenced by pointers embedded in the generated code.
     _ops: Box<[IntermediateOp]>,
 }
 
 impl JitProgram {
     pub fn compile(program: &IntermediateProgram) -> Result<JitProgram> {
-        Self::build(program.ops(), &[])
+        Self::build(program.ops(), &[], &[])
     }
 
     /// Compiles an optimized program, using its type analysis to drop the
     /// run-time tag checks on registers proven to hold `Uint64` values.
     pub fn compile_optimized(program: &OptimizedProgram) -> Result<JitProgram> {
-        Self::build(program.ops(), program.types())
+        Self::build(program.ops(), program.types(), program.inputs())
     }
 
-    fn build(source: &[IntermediateOp], types: &[RegisterTypes]) -> Result<JitProgram> {
+    fn build(
+        source: &[IntermediateOp],
+        types: &[RegisterTypes],
+        inputs: &[ValueType],
+    ) -> Result<JitProgram> {
         let ops: Box<[IntermediateOp]> = source.into();
         let mut entries: Box<[usize]> = vec![0; ops.len()].into();
 
@@ -135,12 +142,14 @@ impl JitProgram {
             code: Arc::new(JitCode {
                 memory,
                 entries,
+                inputs: inputs.into(),
                 _ops: ops,
             }),
         })
     }
 
     pub(crate) fn run(&self, state: &mut MachineState) -> Result<()> {
+        state.check_inputs(&self.code.inputs)?;
         let Some(entry) = self.code.entries.get(state.current) else {
             return Err(MachineError::InstructionOverflow);
         };
@@ -293,6 +302,7 @@ fn status_of_error(error: MachineError) -> i64 {
         MachineError::InvalidOpCode => 7,
         MachineError::MemoryUnavailable => 8,
         MachineError::StepUnsupported => 9,
+        MachineError::InputMismatch => 10,
     })
 }
 
@@ -306,6 +316,7 @@ fn error_of_status(status: i64) -> MachineError {
         6 => MachineError::CallStackEmpty,
         8 => MachineError::MemoryUnavailable,
         9 => MachineError::StepUnsupported,
+        10 => MachineError::InputMismatch,
         _ => MachineError::InvalidOpCode,
     }
 }
