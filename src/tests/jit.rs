@@ -4,8 +4,8 @@
 ))]
 
 use crate::machine::error::MachineError;
+use crate::machine::intermediate::IntermediateProgram;
 use crate::machine::jit::JitProgram;
-use crate::machine::optimized::OptimizedProgram;
 use crate::machine::value::MachineValue;
 use crate::machine::{Machine, MachineProgram, ops};
 use crate::op;
@@ -15,8 +15,8 @@ use crate::program;
 use crate::program::RawProgram;
 
 fn jit(program: &'static RawProgram) -> MachineProgram<'static> {
-    let optimized = OptimizedProgram::compile(program).unwrap();
-    MachineProgram::Jit(JitProgram::compile(&optimized).unwrap())
+    let intermediate = IntermediateProgram::compile(program).unwrap();
+    MachineProgram::Jit(JitProgram::compile(&intermediate).unwrap())
 }
 
 fn top(program: &'static RawProgram) -> MachineValue {
@@ -53,9 +53,9 @@ fn fast_paths_fall_back_for_other_types() {
     );
 
     let mut interpreted = Machine::new(ops::all());
-    let optimized = OptimizedProgram::compile(&PROGRAM).unwrap();
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
     interpreted
-        .run(&MachineProgram::Optimized(optimized))
+        .run(&MachineProgram::Intermediate(intermediate))
         .unwrap();
     let expected = interpreted.state().pop().unwrap();
 
@@ -94,9 +94,9 @@ fn errors_match_the_interpreter() {
     static PROGRAM: RawProgram = program!(op!(Push, Uint64(1)), op!(Add), op!(Exit));
 
     let mut interpreted = Machine::new(ops::all());
-    let optimized = OptimizedProgram::compile(&PROGRAM).unwrap();
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
     let interpreted_error = interpreted
-        .run(&MachineProgram::Optimized(optimized))
+        .run(&MachineProgram::Intermediate(intermediate))
         .unwrap_err();
 
     let mut jitted = Machine::new(ops::all());

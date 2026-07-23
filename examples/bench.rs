@@ -1,6 +1,6 @@
 use std::str::FromStr;
 use std::time::Instant;
-use tinyvm::machine::optimized::OptimizedProgram;
+use tinyvm::machine::intermediate::IntermediateProgram;
 use tinyvm::machine::value::MachineValue;
 use tinyvm::machine::{Machine, MachineProgram, ops};
 use tinyvm::program::RawProgram;
@@ -36,8 +36,8 @@ fn main() {
             MachineProgram::Inlined(ops::all().inline(&program).unwrap()),
         ),
         (
-            "optimized",
-            MachineProgram::Optimized(OptimizedProgram::compile(&program).unwrap()),
+            "intermediate",
+            MachineProgram::Intermediate(IntermediateProgram::compile(&program).unwrap()),
         ),
     ];
 
@@ -48,10 +48,10 @@ fn main() {
     {
         use tinyvm::machine::jit::JitProgram;
 
-        let optimized = OptimizedProgram::compile(&program).unwrap();
+        let intermediate = IntermediateProgram::compile(&program).unwrap();
         modes.push((
             "jit",
-            MachineProgram::Jit(JitProgram::compile(&optimized).unwrap()),
+            MachineProgram::Jit(JitProgram::compile(&intermediate).unwrap()),
         ));
     }
 

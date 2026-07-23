@@ -68,7 +68,7 @@ impl BinaryOpKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum OptimizedOp {
+pub enum IntermediateOp {
     PushValue(MachineValue),
     PushRegister(usize),
     PopRegister(usize),
@@ -108,36 +108,36 @@ pub enum OptimizedOp {
     },
 }
 
-impl OptimizedOp {
+impl IntermediateOp {
     pub fn compile(op: &Op) -> Result<Self> {
         Ok(match op.code {
             OpCode::Push => match op.arg.register_index() {
-                Some(index) => OptimizedOp::PushRegister(index),
+                Some(index) => IntermediateOp::PushRegister(index),
                 None => match op.arg {
                     OpArg::Instruction(_) => return Err(MachineError::ValueExpected),
-                    arg => OptimizedOp::PushValue(MachineValue::from(arg)),
+                    arg => IntermediateOp::PushValue(MachineValue::from(arg)),
                 },
             },
-            OpCode::Pop => OptimizedOp::PopRegister(
+            OpCode::Pop => IntermediateOp::PopRegister(
                 op.arg
                     .register_index()
                     .ok_or(MachineError::RegisterExpected)?,
             ),
-            OpCode::Add => OptimizedOp::Add,
-            OpCode::Subtract => OptimizedOp::Subtract,
-            OpCode::Multiply => OptimizedOp::Multiply,
-            OpCode::Divide => OptimizedOp::Divide,
-            OpCode::Remainder => OptimizedOp::Remainder,
-            OpCode::JumpIfEqual => OptimizedOp::JumpIfEqual(instruction_target(op)?),
-            OpCode::JumpIfZero => OptimizedOp::JumpIfZero(instruction_target(op)?),
-            OpCode::Jump => OptimizedOp::Jump(instruction_target(op)?),
-            OpCode::Call => OptimizedOp::Call(instruction_target(op)?),
-            OpCode::Return => OptimizedOp::Return,
-            OpCode::Exit => OptimizedOp::Exit,
-            OpCode::CountLeadingZeros => OptimizedOp::CountLeadingZeros,
-            OpCode::CountLeadingOnes => OptimizedOp::CountLeadingOnes,
-            OpCode::CountTrailingZeros => OptimizedOp::CountTrailingZeros,
-            OpCode::CountTrailingOnes => OptimizedOp::CountTrailingOnes,
+            OpCode::Add => IntermediateOp::Add,
+            OpCode::Subtract => IntermediateOp::Subtract,
+            OpCode::Multiply => IntermediateOp::Multiply,
+            OpCode::Divide => IntermediateOp::Divide,
+            OpCode::Remainder => IntermediateOp::Remainder,
+            OpCode::JumpIfEqual => IntermediateOp::JumpIfEqual(instruction_target(op)?),
+            OpCode::JumpIfZero => IntermediateOp::JumpIfZero(instruction_target(op)?),
+            OpCode::Jump => IntermediateOp::Jump(instruction_target(op)?),
+            OpCode::Call => IntermediateOp::Call(instruction_target(op)?),
+            OpCode::Return => IntermediateOp::Return,
+            OpCode::Exit => IntermediateOp::Exit,
+            OpCode::CountLeadingZeros => IntermediateOp::CountLeadingZeros,
+            OpCode::CountLeadingOnes => IntermediateOp::CountLeadingOnes,
+            OpCode::CountTrailingZeros => IntermediateOp::CountTrailingZeros,
+            OpCode::CountTrailingOnes => IntermediateOp::CountTrailingOnes,
         })
     }
 
@@ -156,7 +156,7 @@ impl OptimizedOp {
             && let Some(dst) = ops[3].arg.register_index()
         {
             return Some((
-                OptimizedOp::Binary {
+                IntermediateOp::Binary {
                     kind,
                     lhs,
                     rhs,
@@ -174,7 +174,7 @@ impl OptimizedOp {
             && let OpArg::Instruction(target) = ops[2].arg
         {
             return Some((
-                OptimizedOp::JumpIfEqualValues {
+                IntermediateOp::JumpIfEqualValues {
                     lhs,
                     rhs,
                     target: target as usize,
@@ -191,7 +191,7 @@ impl OptimizedOp {
                 && let OpArg::Instruction(target) = ops[1].arg
             {
                 return Some((
-                    OptimizedOp::JumpIfZeroValue {
+                    IntermediateOp::JumpIfZeroValue {
                         src,
                         target: target as usize,
                     },
@@ -202,7 +202,7 @@ impl OptimizedOp {
             if ops[1].code == OpCode::Pop
                 && let Some(dst) = ops[1].arg.register_index()
             {
-                return Some((OptimizedOp::Copy { src, dst }, 2));
+                return Some((IntermediateOp::Copy { src, dst }, 2));
             }
         }
 
@@ -211,12 +211,12 @@ impl OptimizedOp {
 
     fn remap(&mut self, remap: impl Fn(usize) -> usize) {
         match self {
-            OptimizedOp::JumpIfEqual(target)
-            | OptimizedOp::JumpIfZero(target)
-            | OptimizedOp::Jump(target)
-            | OptimizedOp::Call(target)
-            | OptimizedOp::JumpIfEqualValues { target, .. }
-            | OptimizedOp::JumpIfZeroValue { target, .. } => *target = remap(*target),
+            IntermediateOp::JumpIfEqual(target)
+            | IntermediateOp::JumpIfZero(target)
+            | IntermediateOp::Jump(target)
+            | IntermediateOp::Call(target)
+            | IntermediateOp::JumpIfEqualValues { target, .. }
+            | IntermediateOp::JumpIfZeroValue { target, .. } => *target = remap(*target),
             _ => {}
         }
     }
@@ -224,50 +224,50 @@ impl OptimizedOp {
     #[inline(always)]
     pub(crate) fn perform(&self, machine: &mut MachineState, pc: usize) -> Result<Option<usize>> {
         Ok(match *self {
-            OptimizedOp::PushValue(value) => {
+            IntermediateOp::PushValue(value) => {
                 machine.push(value);
                 Some(pc + 1)
             }
-            OptimizedOp::PushRegister(index) => {
+            IntermediateOp::PushRegister(index) => {
                 machine.push(machine.bank.get(index));
                 Some(pc + 1)
             }
-            OptimizedOp::PopRegister(index) => {
+            IntermediateOp::PopRegister(index) => {
                 let value = machine.pop()?;
                 machine.bank.set(index, value);
                 Some(pc + 1)
             }
-            OptimizedOp::Add => {
+            IntermediateOp::Add => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 + value1);
                 Some(pc + 1)
             }
-            OptimizedOp::Subtract => {
+            IntermediateOp::Subtract => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 - value1);
                 Some(pc + 1)
             }
-            OptimizedOp::Multiply => {
+            IntermediateOp::Multiply => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 * value1);
                 Some(pc + 1)
             }
-            OptimizedOp::Divide => {
+            IntermediateOp::Divide => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 / value1);
                 Some(pc + 1)
             }
-            OptimizedOp::Remainder => {
+            IntermediateOp::Remainder => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 machine.push(value2 % value1);
                 Some(pc + 1)
             }
-            OptimizedOp::JumpIfEqual(target) => {
+            IntermediateOp::JumpIfEqual(target) => {
                 let value1 = machine.pop()?;
                 let value2 = machine.pop()?;
                 if value1 == value2 {
@@ -276,7 +276,7 @@ impl OptimizedOp {
                     Some(pc + 1)
                 }
             }
-            OptimizedOp::JumpIfZero(target) => {
+            IntermediateOp::JumpIfZero(target) => {
                 let value = machine.pop()?;
                 if value.is_zero() {
                     Some(target)
@@ -284,40 +284,40 @@ impl OptimizedOp {
                     Some(pc + 1)
                 }
             }
-            OptimizedOp::Jump(target) => Some(target),
-            OptimizedOp::Call(target) => {
+            IntermediateOp::Jump(target) => Some(target),
+            IntermediateOp::Call(target) => {
                 machine.calls.push(MachineValue::ReturnAddress(pc + 1));
                 Some(target)
             }
-            OptimizedOp::Return => {
+            IntermediateOp::Return => {
                 let value = machine.calls.pop().ok_or(MachineError::CallStackEmpty)?;
                 match value {
                     MachineValue::ReturnAddress(target) => Some(target),
                     _ => return Err(MachineError::InstructionExpected),
                 }
             }
-            OptimizedOp::Exit => None,
-            OptimizedOp::CountLeadingZeros => {
+            IntermediateOp::Exit => None,
+            IntermediateOp::CountLeadingZeros => {
                 let value = machine.pop()?;
                 machine.push(value.leading_zeros());
                 Some(pc + 1)
             }
-            OptimizedOp::CountLeadingOnes => {
+            IntermediateOp::CountLeadingOnes => {
                 let value = machine.pop()?;
                 machine.push(value.leading_ones());
                 Some(pc + 1)
             }
-            OptimizedOp::CountTrailingZeros => {
+            IntermediateOp::CountTrailingZeros => {
                 let value = machine.pop()?;
                 machine.push(value.trailing_zeros());
                 Some(pc + 1)
             }
-            OptimizedOp::CountTrailingOnes => {
+            IntermediateOp::CountTrailingOnes => {
                 let value = machine.pop()?;
                 machine.push(value.trailing_ones());
                 Some(pc + 1)
             }
-            OptimizedOp::Binary {
+            IntermediateOp::Binary {
                 kind,
                 lhs,
                 rhs,
@@ -327,19 +327,19 @@ impl OptimizedOp {
                 machine.bank.set(dst, result);
                 Some(pc + 1)
             }
-            OptimizedOp::Copy { src, dst } => {
+            IntermediateOp::Copy { src, dst } => {
                 let value = src.resolve(&machine.bank);
                 machine.bank.set(dst, value);
                 Some(pc + 1)
             }
-            OptimizedOp::JumpIfEqualValues { lhs, rhs, target } => {
+            IntermediateOp::JumpIfEqualValues { lhs, rhs, target } => {
                 if rhs.resolve(&machine.bank) == lhs.resolve(&machine.bank) {
                     Some(target)
                 } else {
                     Some(pc + 1)
                 }
             }
-            OptimizedOp::JumpIfZeroValue { src, target } => {
+            IntermediateOp::JumpIfZeroValue { src, target } => {
                 if src.resolve(&machine.bank).is_zero() {
                     Some(target)
                 } else {
@@ -358,11 +358,11 @@ fn instruction_target(op: &Op) -> Result<usize> {
 }
 
 #[derive(Clone, Debug)]
-pub struct OptimizedProgram {
-    ops: Vec<OptimizedOp>,
+pub struct IntermediateProgram {
+    ops: Vec<IntermediateOp>,
 }
 
-impl OptimizedProgram {
+impl IntermediateProgram {
     pub fn compile(program: &RawProgram) -> Result<Self> {
         let source = program.ops();
 
@@ -385,9 +385,9 @@ impl OptimizedProgram {
         let mut map = vec![0; source.len()];
         let mut index = 0;
         while index < source.len() {
-            let (op, length) = match OptimizedOp::fuse(&source[index..], &targets[index..]) {
+            let (op, length) = match IntermediateOp::fuse(&source[index..], &targets[index..]) {
                 Some(fused) => fused,
-                None => (OptimizedOp::compile(&source[index])?, 1),
+                None => (IntermediateOp::compile(&source[index])?, 1),
             };
             for offset in 0..length {
                 map[index + offset] = ops.len();
@@ -410,7 +410,7 @@ impl OptimizedProgram {
         Ok(Self { ops })
     }
 
-    pub fn ops(&self) -> &[OptimizedOp] {
+    pub fn ops(&self) -> &[IntermediateOp] {
         &self.ops
     }
 }
