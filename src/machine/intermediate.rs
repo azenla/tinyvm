@@ -209,7 +209,7 @@ impl IntermediateOp {
         None
     }
 
-    fn remap(&mut self, remap: impl Fn(usize) -> usize) {
+    pub(crate) fn remap(&mut self, remap: impl Fn(usize) -> usize) {
         match self {
             IntermediateOp::JumpIfEqual(target)
             | IntermediateOp::JumpIfZero(target)

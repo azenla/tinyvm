@@ -51,6 +51,16 @@ fn runs_intermediate() {
     assert_eq!(value, MachineValue::Uint64(832040));
 }
 
+#[test]
+fn runs_optimized() {
+    use crate::machine::optimizer::OptimizedProgram;
+
+    let intermediate = IntermediateProgram::compile(&constants::FIB_PROGRAM).unwrap();
+    let program = MachineProgram::Optimized(OptimizedProgram::compile(&intermediate));
+    let value = run_fib_program(ops::all(), program);
+    assert_eq!(value, MachineValue::Uint64(832040));
+}
+
 #[cfg(all(
     any(unix, windows),
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -61,6 +71,22 @@ fn runs_jit() {
 
     let intermediate = IntermediateProgram::compile(&constants::FIB_PROGRAM).unwrap();
     let program = MachineProgram::Jit(JitProgram::compile(&intermediate).unwrap());
+    let value = run_fib_program(ops::all(), program);
+    assert_eq!(value, MachineValue::Uint64(832040));
+}
+
+#[cfg(all(
+    any(unix, windows),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn runs_jit_optimized() {
+    use crate::machine::jit::JitProgram;
+    use crate::machine::optimizer::OptimizedProgram;
+
+    let intermediate = IntermediateProgram::compile(&constants::FIB_PROGRAM).unwrap();
+    let optimized = OptimizedProgram::compile(&intermediate);
+    let program = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
     let value = run_fib_program(ops::all(), program);
     assert_eq!(value, MachineValue::Uint64(832040));
 }

@@ -4,3 +4,4 @@ pub mod execution;
 pub mod fib;
 pub mod fusion;
 pub mod jit;
+pub mod optimizer;

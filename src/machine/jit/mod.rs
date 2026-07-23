@@ -1,6 +1,7 @@
 use crate::machine::MachineState;
 use crate::machine::error::{MachineError, Result};
 use crate::machine::intermediate::{BinaryOpKind, IntermediateOp, IntermediateProgram, Source};
+use crate::machine::optimizer::{OptimizedProgram, RegisterTypes, ValueType};
 use crate::machine::registers::RegisterBank;
 use crate::machine::value::MachineValue;
 use std::sync::Arc;
@@ -35,10 +36,13 @@ pub(super) fn uint64_tag() -> u8 {
 }
 
 /// An operand a fast path can evaluate without calling a helper: a register
-/// slot checked for the `Uint64` tag at run time, or a `Uint64` immediate.
+/// slot checked for the `Uint64` tag at run time, a register slot the
+/// optimizer proved holds a `Uint64` and needs no check, or a `Uint64`
+/// immediate.
 #[derive(Clone, Copy)]
 pub(super) enum FastOperand {
     Register(usize),
+    TrustedRegister(usize),
     Immediate(u64),
 }
 
@@ -54,9 +58,19 @@ fn slot(index: usize) -> usize {
     std::mem::offset_of!(MachineState, bank) + RegisterBank::slot_offset(index)
 }
 
-fn fast_operand(source: &Source) -> Option<FastOperand> {
+/// The operand form of a register slot: trusted when the optimizer proved
+/// the register holds a `Uint64`, tag-checked at run time otherwise.
+fn register_operand(index: usize, types: &RegisterTypes) -> FastOperand {
+    if types.get(index) == ValueType::Uint64 {
+        FastOperand::TrustedRegister(slot(index))
+    } else {
+        FastOperand::Register(slot(index))
+    }
+}
+
+fn fast_operand(source: &Source, types: &RegisterTypes) -> Option<FastOperand> {
     match source {
-        Source::Register(index) => Some(FastOperand::Register(slot(*index))),
+        Source::Register(index) => Some(register_operand(*index, types)),
         Source::Value(MachineValue::Uint64(value)) => Some(FastOperand::Immediate(*value)),
         Source::Value(_) => None,
     }
@@ -83,7 +97,17 @@ struct JitCode {
 
 impl JitProgram {
     pub fn compile(program: &IntermediateProgram) -> Result<JitProgram> {
-        let ops: Box<[IntermediateOp]> = program.ops().into();
+        Self::build(program.ops(), &[])
+    }
+
+    /// Compiles an optimized program, using its type analysis to drop the
+    /// run-time tag checks on registers proven to hold `Uint64` values.
+    pub fn compile_optimized(program: &OptimizedProgram) -> Result<JitProgram> {
+        Self::build(program.ops(), program.types())
+    }
+
+    fn build(source: &[IntermediateOp], types: &[RegisterTypes]) -> Result<JitProgram> {
+        let ops: Box<[IntermediateOp]> = source.into();
         let mut entries: Box<[usize]> = vec![0; ops.len()].into();
 
         let mut assembler = Assembler::new(entries.as_ptr() as usize);
@@ -92,7 +116,8 @@ impl JitProgram {
         let mut offsets = Vec::with_capacity(ops.len());
         for (pc, op) in ops.iter().enumerate() {
             offsets.push(assembler.offset());
-            emit(&mut assembler, op, pc, ops.len());
+            let types = types.get(pc).copied().unwrap_or_default();
+            emit(&mut assembler, op, pc, ops.len(), &types);
         }
 
         let overflow = assembler.offset();
@@ -129,7 +154,13 @@ impl JitProgram {
     }
 }
 
-fn emit(assembler: &mut Assembler, op: &IntermediateOp, pc: usize, length: usize) {
+fn emit(
+    assembler: &mut Assembler,
+    op: &IntermediateOp,
+    pc: usize,
+    length: usize,
+    types: &RegisterTypes,
+) {
     let data = op as *const IntermediateOp as u64;
     let position = pc as u64;
     match op {
@@ -195,7 +226,7 @@ fn emit(assembler: &mut Assembler, op: &IntermediateOp, pc: usize, length: usize
                 // division, not a hardware trap.
                 BinaryOpKind::Divide | BinaryOpKind::Remainder => None,
             };
-            match (fast, fast_operand(lhs), fast_operand(rhs)) {
+            match (fast, fast_operand(lhs, types), fast_operand(rhs, types)) {
                 (Some(kind), Some(lhs), Some(rhs)) => {
                     assembler.binary_fast(
                         kind,
@@ -220,7 +251,9 @@ fn emit(assembler: &mut Assembler, op: &IntermediateOp, pc: usize, length: usize
                 if rhs == lhs {
                     assembler.jump(*target);
                 }
-            } else if let (Some(lhs), Some(rhs)) = (fast_operand(lhs), fast_operand(rhs)) {
+            } else if let (Some(lhs), Some(rhs)) =
+                (fast_operand(lhs, types), fast_operand(rhs, types))
+            {
                 assembler.jump_if_equal_fast(
                     lhs,
                     rhs,
@@ -235,7 +268,7 @@ fn emit(assembler: &mut Assembler, op: &IntermediateOp, pc: usize, length: usize
         }
         IntermediateOp::JumpIfZeroValue { src, target } => match src {
             Source::Register(index) => assembler.jump_if_zero_fast(
-                slot(*index),
+                register_operand(*index, types),
                 *target,
                 helper::jump_if_zero_values as *const (),
                 data,

@@ -1,11 +1,12 @@
 use crate::machine::error::{MachineError, Result};
-use crate::machine::intermediate::IntermediateProgram;
+use crate::machine::intermediate::{IntermediateOp, IntermediateProgram};
 #[cfg(all(
     any(unix, windows),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 use crate::machine::jit::JitProgram;
 use crate::machine::ops::{InlinedOpHandlers, OpHandlerSet};
+use crate::machine::optimizer::OptimizedProgram;
 use crate::machine::registers::RegisterBank;
 use crate::machine::value::MachineValue;
 use crate::op::{Op, OpArg};
@@ -19,6 +20,7 @@ pub mod intermediate;
 ))]
 pub mod jit;
 pub mod ops;
+pub mod optimizer;
 pub mod registers;
 pub mod value;
 
@@ -34,6 +36,7 @@ pub enum MachineProgram<'program> {
     Uncompiled(&'program RawProgram<'program>),
     Inlined(InlinedOpHandlers<'program>),
     Intermediate(IntermediateProgram),
+    Optimized(OptimizedProgram),
     #[cfg(all(
         any(unix, windows),
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -144,12 +147,9 @@ impl Machine {
         self.step_shared(result)
     }
 
-    pub fn step_intermediate(&mut self, program: &IntermediateProgram) -> Result<MachineLoopState> {
+    fn step_ops(&mut self, ops: &[IntermediateOp]) -> Result<MachineLoopState> {
         let pc = self.state.current;
-        let op = program
-            .ops()
-            .get(pc)
-            .ok_or(MachineError::InstructionOverflow)?;
+        let op = ops.get(pc).ok_or(MachineError::InstructionOverflow)?;
         match op.perform(&mut self.state, pc)? {
             Some(next) => {
                 self.state.current = next;
@@ -163,11 +163,20 @@ impl Machine {
         }
     }
 
+    pub fn step_intermediate(&mut self, program: &IntermediateProgram) -> Result<MachineLoopState> {
+        self.step_ops(program.ops())
+    }
+
+    pub fn step_optimized(&mut self, program: &OptimizedProgram) -> Result<MachineLoopState> {
+        self.step_ops(program.ops())
+    }
+
     pub fn step(&mut self, program: &MachineProgram) -> Result<MachineLoopState> {
         match program {
             MachineProgram::Uncompiled(program) => self.step_uncompiled(program),
             MachineProgram::Inlined(program) => self.step_inlined(program),
             MachineProgram::Intermediate(program) => self.step_intermediate(program),
+            MachineProgram::Optimized(program) => self.step_optimized(program),
             #[cfg(all(
                 any(unix, windows),
                 any(target_arch = "x86_64", target_arch = "aarch64")
@@ -176,8 +185,7 @@ impl Machine {
         }
     }
 
-    fn run_intermediate(&mut self, program: &IntermediateProgram) -> Result<()> {
-        let ops = program.ops();
+    fn run_ops(&mut self, ops: &[IntermediateOp]) -> Result<()> {
         let mut pc = self.state.current;
         let result = loop {
             let Some(op) = ops.get(pc) else {
@@ -209,7 +217,9 @@ impl Machine {
                 }
             },
 
-            MachineProgram::Intermediate(program) => return self.run_intermediate(program),
+            MachineProgram::Intermediate(program) => return self.run_ops(program.ops()),
+
+            MachineProgram::Optimized(program) => return self.run_ops(program.ops()),
 
             #[cfg(all(
                 any(unix, windows),

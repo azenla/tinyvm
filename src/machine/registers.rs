@@ -2,7 +2,7 @@ use crate::machine::error::MachineError;
 use crate::machine::value::MachineValue;
 use crate::op::OpArg;
 
-const REGISTER_BANK_COUNT: usize = 9;
+pub(crate) const REGISTER_BANK_COUNT: usize = 9;
 
 #[derive(PartialEq, Clone, Copy, Debug, Default)]
 pub struct RegisterBank {

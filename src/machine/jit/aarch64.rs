@@ -168,8 +168,9 @@ impl Assembler {
     }
 
     /// Loads an operand's payload into `register` (x0 or x1). Register
-    /// operands are checked for the `Uint64` tag first; a failed check
-    /// branches to the pending slow path.
+    /// operands are checked for the `Uint64` tag first — a failed check
+    /// branches to the pending slow path — while trusted registers were
+    /// proven `Uint64` by the optimizer and skip the check.
     fn load_operand(
         &mut self,
         operand: FastOperand,
@@ -183,6 +184,10 @@ impl Assembler {
                 self.word(0x3940_0000 | ((slot as u32) << 10) | (STATE << 5) | 2); // ldrb w2, [x19, #slot]
                 self.word(0x7100_001F | (tag << 10) | (2 << 5)); // cmp w2, #tag
                 checks.push(self.forward(0x5400_0001, FixupKind::Imm19)); // b.ne slow
+                self.word(0xF940_0000 | (payload << 10) | (STATE << 5) | register); // ldr
+            }
+            FastOperand::TrustedRegister(slot) => {
+                let payload = ((slot + PAYLOAD_OFFSET) / 8) as u32;
                 self.word(0xF940_0000 | (payload << 10) | (STATE << 5) | register); // ldr
             }
             FastOperand::Immediate(value) => self.load_immediate(register, value),
@@ -244,13 +249,13 @@ impl Assembler {
 
     pub(super) fn jump_if_zero_fast(
         &mut self,
-        source: usize,
+        source: FastOperand,
         target: usize,
         helper: *const (),
         op: u64,
     ) {
         let mut checks = Vec::new();
-        self.load_operand(FastOperand::Register(source), 0, &mut checks);
+        self.load_operand(source, 0, &mut checks);
         self.branch_fixup(0xB400_0000, FixupKind::Imm19, FixupTarget::Op(target)); // cbz x0
         self.slow_path(checks, |assembler| {
             assembler.call(helper, &[op]);

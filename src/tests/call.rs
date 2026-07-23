@@ -50,6 +50,15 @@ fn returns_to_instruction_after_call_intermediate() {
     assert_eq!(run(ops::all(), program), MachineValue::Uint64(99));
 }
 
+#[test]
+fn returns_to_instruction_after_call_optimized() {
+    use crate::machine::optimizer::OptimizedProgram;
+
+    let intermediate = IntermediateProgram::compile(&CALL_PROGRAM).unwrap();
+    let program = MachineProgram::Optimized(OptimizedProgram::compile(&intermediate));
+    assert_eq!(run(ops::all(), program), MachineValue::Uint64(99));
+}
+
 #[cfg(all(
     any(unix, windows),
     any(target_arch = "x86_64", target_arch = "aarch64")
