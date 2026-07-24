@@ -151,6 +151,21 @@ fn allocate(
         }
     }
 
+    // A register read inline (as an op's `Source`) comes from its CPU register
+    // when proven `Uint64` but straight from memory otherwise, and a pinned
+    // register's memory payload goes stale between spills. So a register read
+    // inline while not `Uint64` cannot be pinned; helper reads are always
+    // coherent (the bank is spilled before every call) and do not disqualify.
+    macro_rules! read_inline {
+        ($pc:expr, $index:expr) => {{
+            let index = $index;
+            usage[index] += 1;
+            if type_at($pc, index) != ValueType::Uint64 {
+                eligible[index] = false;
+            }
+        }};
+    }
+
     for (pc, op) in ops.iter().enumerate() {
         match op {
             IntermediateOp::PushRegister(index) | IntermediateOp::PopRegister(index) => {
@@ -158,17 +173,17 @@ fn allocate(
             }
             IntermediateOp::Binary { lhs, rhs, dst, .. } => {
                 if let Source::Register(index) = lhs {
-                    usage[*index] += 1;
+                    read_inline!(pc, *index);
                 }
                 if let Source::Register(index) = rhs {
-                    usage[*index] += 1;
+                    read_inline!(pc, *index);
                 }
                 usage[*dst] += 1;
             }
             IntermediateOp::Copy { src, dst } => {
                 match src {
                     Source::Register(index) => {
-                        usage[*index] += 1;
+                        read_inline!(pc, *index);
                         // A copy from an unproven source would land a
                         // possibly-non-`Uint64` value in the destination.
                         if type_at(pc, *index) != ValueType::Uint64 {
@@ -184,14 +199,14 @@ fn allocate(
                 src: Source::Register(index),
                 ..
             } => {
-                usage[*index] += 1;
+                read_inline!(pc, *index);
             }
             IntermediateOp::JumpIfEqualValues { lhs, rhs, .. } => {
                 if let Source::Register(index) = lhs {
-                    usage[*index] += 1;
+                    read_inline!(pc, *index);
                 }
                 if let Source::Register(index) = rhs {
-                    usage[*index] += 1;
+                    read_inline!(pc, *index);
                 }
             }
             _ => {}

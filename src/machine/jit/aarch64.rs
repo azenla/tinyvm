@@ -196,6 +196,10 @@ impl Assembler {
     }
 
     pub(super) fn call(&mut self, function: *const (), args: &[u64]) {
+        // The helper reads and writes the bank directly, so flush the pinned
+        // registers' payloads to it first; callers reload afterward if the
+        // helper may have written the bank.
+        self.spill_pinned();
         self.move_register(ARGUMENTS[0], STATE);
         for (index, argument) in args.iter().enumerate() {
             self.load_immediate(ARGUMENTS[index + 1], *argument);
@@ -289,15 +293,28 @@ impl Assembler {
         }
     }
 
-    /// Writes `register` through to the destination slot's payload — keeping
-    /// the memory bank coherent — plus a whole tag word when the slot did not
-    /// already hold a `Uint64`. The tag scratch (x1) never aliases a result
-    /// register, which is only x0 or a pinned register.
+    /// Records the result of a fast-path write. A memory destination's only
+    /// home is its slot, so the payload is stored there. A pinned destination
+    /// keeps its payload in the CPU register — spilled to the slot only at call
+    /// boundaries — so just the tag is written through, and only when the slot
+    /// did not already hold a `Uint64`. The tag scratch (x1) never aliases a
+    /// result register, which is only x0 or a pinned register.
     fn store_through(&mut self, destination: &FastDest, register: u32, write_tag: bool) {
-        self.store(register, destination.slot + PAYLOAD_OFFSET);
+        if destination.pin.is_none() {
+            self.store(register, destination.slot + PAYLOAD_OFFSET);
+        }
         if write_tag {
             self.load_immediate(1, u64::from(super::uint64_tag()));
             self.store(1, destination.slot);
+        }
+    }
+
+    /// Writes every pinned register's payload back to its bank slot, making the
+    /// bank coherent for the helper a call is about to enter.
+    fn spill_pinned(&mut self) {
+        let pinned = self.pinned.clone();
+        for (register, slot) in &pinned {
+            self.store(*register, slot + PAYLOAD_OFFSET);
         }
     }
 
