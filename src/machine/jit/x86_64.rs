@@ -1,4 +1,4 @@
-use super::{FastBinaryOp, FastOperand, PAYLOAD_OFFSET};
+use super::{FastBinary, FastBinaryOp, FastOperand, PAYLOAD_OFFSET};
 use crate::machine::error::{MachineError, Result};
 
 // Register conventions for generated code: rbx holds the machine state
@@ -200,13 +200,17 @@ impl Assembler {
     }
 
     /// Stores the `Uint64` in rax to a register slot: the payload word, then
-    /// a whole tag word so the slot's padding stays defined.
-    fn store_result(&mut self, destination: usize) {
+    /// a whole tag word so the slot's padding stays defined. `write_tag` is
+    /// false when the slot already holds a `Uint64` tag, leaving only the
+    /// payload.
+    fn store_result(&mut self, destination: usize, write_tag: bool) {
         self.bytes(&[0x48, 0x89]); // mov [rbx + payload], rax
         self.memory(0, (destination + PAYLOAD_OFFSET) as i32);
-        self.bytes(&[0x48, 0xC7]); // mov qword [rbx + slot], tag
-        self.memory(0, destination as i32);
-        self.bytes(&u32::from(super::uint64_tag()).to_le_bytes());
+        if write_tag {
+            self.bytes(&[0x48, 0xC7]); // mov qword [rbx + slot], tag
+            self.memory(0, destination as i32);
+            self.bytes(&u32::from(super::uint64_tag()).to_le_bytes());
+        }
     }
 
     fn slow_path(&mut self, checks: Vec<PendingBranch>, emit: impl FnOnce(&mut Self)) {
@@ -221,24 +225,39 @@ impl Assembler {
         self.bind(done);
     }
 
-    pub(super) fn binary_fast(
-        &mut self,
-        kind: FastBinaryOp,
-        lhs: FastOperand,
-        rhs: FastOperand,
-        destination: usize,
-        helper: *const (),
-        op: u64,
-    ) {
+    pub(super) fn binary_fast(&mut self, binary: FastBinary) {
+        let FastBinary {
+            kind,
+            lhs,
+            rhs,
+            destination,
+            helper,
+            op,
+            write_tag,
+        } = binary;
         let mut checks = Vec::new();
-        self.load_operand(lhs, 0, &mut checks);
-        self.load_operand(rhs, 1, &mut checks);
-        match kind {
-            FastBinaryOp::Add => self.bytes(&[0x48, 0x01, 0xC8]), // add rax, rcx
-            FastBinaryOp::Subtract => self.bytes(&[0x48, 0x29, 0xC8]), // sub rax, rcx
-            FastBinaryOp::Multiply => self.bytes(&[0x48, 0x0F, 0xAF, 0xC1]), // imul rax, rcx
+        // add/sub of a base operand and an immediate that fits a sign-extended
+        // imm32 fold into a single instruction, sparing the scratch load.
+        if let Some((base, value)) = super::immediate_form(kind, lhs, rhs)
+            && value <= i32::MAX as u64
+        {
+            self.load_operand(base, 0, &mut checks);
+            match kind {
+                FastBinaryOp::Add => self.bytes(&[0x48, 0x05]), // add rax, imm32
+                FastBinaryOp::Subtract => self.bytes(&[0x48, 0x2D]), // sub rax, imm32
+                FastBinaryOp::Multiply => unreachable!(),
+            }
+            self.bytes(&(value as u32).to_le_bytes());
+        } else {
+            self.load_operand(lhs, 0, &mut checks);
+            self.load_operand(rhs, 1, &mut checks);
+            match kind {
+                FastBinaryOp::Add => self.bytes(&[0x48, 0x01, 0xC8]), // add rax, rcx
+                FastBinaryOp::Subtract => self.bytes(&[0x48, 0x29, 0xC8]), // sub rax, rcx
+                FastBinaryOp::Multiply => self.bytes(&[0x48, 0x0F, 0xAF, 0xC1]), // imul rax, rcx
+            }
         }
-        self.store_result(destination);
+        self.store_result(destination, write_tag);
         self.slow_path(checks, |assembler| assembler.call(helper, &[op]));
     }
 

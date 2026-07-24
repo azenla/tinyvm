@@ -1,4 +1,4 @@
-use super::{FastBinaryOp, FastOperand, PAYLOAD_OFFSET};
+use super::{FastBinary, FastBinaryOp, FastOperand, PAYLOAD_OFFSET};
 use crate::machine::error::{MachineError, Result};
 
 // Register conventions for generated code: x19 holds the machine state
@@ -195,12 +195,15 @@ impl Assembler {
     }
 
     /// Stores the `Uint64` in x0 to a register slot: the payload word, then a
-    /// whole tag word so the slot's padding stays defined.
-    fn store_result(&mut self, destination: usize) {
+    /// whole tag word so the slot's padding stays defined. `write_tag` is false
+    /// when the slot already holds a `Uint64` tag, leaving only the payload.
+    fn store_result(&mut self, destination: usize, write_tag: bool) {
         let payload = ((destination + PAYLOAD_OFFSET) / 8) as u32;
         self.word(0xF900_0000 | (payload << 10) | (STATE << 5)); // str x0, [x19, #payload]
-        self.load_immediate(1, u64::from(super::uint64_tag()));
-        self.word(0xF900_0000 | (((destination / 8) as u32) << 10) | (STATE << 5) | 1); // str x1, [x19, #slot]
+        if write_tag {
+            self.load_immediate(1, u64::from(super::uint64_tag()));
+            self.word(0xF900_0000 | (((destination / 8) as u32) << 10) | (STATE << 5) | 1); // str x1, [x19, #slot]
+        }
     }
 
     fn slow_path(&mut self, checks: Vec<PendingBranch>, emit: impl FnOnce(&mut Self)) {
@@ -215,24 +218,39 @@ impl Assembler {
         self.bind(done);
     }
 
-    pub(super) fn binary_fast(
-        &mut self,
-        kind: FastBinaryOp,
-        lhs: FastOperand,
-        rhs: FastOperand,
-        destination: usize,
-        helper: *const (),
-        op: u64,
-    ) {
+    pub(super) fn binary_fast(&mut self, binary: FastBinary) {
+        let FastBinary {
+            kind,
+            lhs,
+            rhs,
+            destination,
+            helper,
+            op,
+            write_tag,
+        } = binary;
         let mut checks = Vec::new();
-        self.load_operand(lhs, 0, &mut checks);
-        self.load_operand(rhs, 1, &mut checks);
-        self.word(match kind {
-            FastBinaryOp::Add => 0x8B01_0000,      // add x0, x0, x1
-            FastBinaryOp::Subtract => 0xCB01_0000, // sub x0, x0, x1
-            FastBinaryOp::Multiply => 0x9B01_7C00, // mul x0, x0, x1
-        });
-        self.store_result(destination);
+        // add/sub of a base operand and an immediate that fits the imm12 field
+        // fold into a single instruction, sparing the scratch-register load.
+        if let Some((base, value)) = super::immediate_form(kind, lhs, rhs)
+            && value <= 0xFFF
+        {
+            self.load_operand(base, 0, &mut checks);
+            let opcode = match kind {
+                FastBinaryOp::Add => 0x9100_0000,      // add x0, x0, #imm
+                FastBinaryOp::Subtract => 0xD100_0000, // sub x0, x0, #imm
+                FastBinaryOp::Multiply => unreachable!(),
+            };
+            self.word(opcode | ((value as u32) << 10));
+        } else {
+            self.load_operand(lhs, 0, &mut checks);
+            self.load_operand(rhs, 1, &mut checks);
+            self.word(match kind {
+                FastBinaryOp::Add => 0x8B01_0000,      // add x0, x0, x1
+                FastBinaryOp::Subtract => 0xCB01_0000, // sub x0, x0, x1
+                FastBinaryOp::Multiply => 0x9B01_7C00, // mul x0, x0, x1
+            });
+        }
+        self.store_result(destination, write_tag);
         self.slow_path(checks, |assembler| assembler.call(helper, &[op]));
     }
 

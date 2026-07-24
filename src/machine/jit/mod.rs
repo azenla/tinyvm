@@ -53,6 +53,20 @@ pub(super) enum FastBinaryOp {
     Multiply,
 }
 
+/// A binary op lowered to a fast path: the operation and operands, the slot to
+/// store into, and the `helper`/`op` pair called when a run-time tag check
+/// fails. `write_tag` is false when the destination already holds a `Uint64`,
+/// so only the payload word needs writing.
+pub(super) struct FastBinary {
+    pub kind: FastBinaryOp,
+    pub lhs: FastOperand,
+    pub rhs: FastOperand,
+    pub destination: usize,
+    pub helper: *const (),
+    pub op: u64,
+    pub write_tag: bool,
+}
+
 /// Byte offset of a register's value slot from the machine state pointer.
 fn slot(index: usize) -> usize {
     std::mem::offset_of!(MachineState, bank) + RegisterBank::slot_offset(index)
@@ -73,6 +87,25 @@ fn fast_operand(source: &Source, types: &RegisterTypes) -> Option<FastOperand> {
         Source::Register(index) => Some(register_operand(*index, types)),
         Source::Value(MachineValue::Uint64(value)) => Some(FastOperand::Immediate(*value)),
         Source::Value(_) => None,
+    }
+}
+
+/// Whether a binary op can be lowered as "base OP immediate", letting the
+/// backend fold the constant into the instruction instead of materializing it
+/// into a scratch register. Add is commutative, so the immediate may sit on
+/// either side; subtract keeps it on the right. Returns the base operand and
+/// the immediate value; each backend decides whether the value fits its own
+/// immediate encoding.
+pub(super) fn immediate_form(
+    kind: FastBinaryOp,
+    lhs: FastOperand,
+    rhs: FastOperand,
+) -> Option<(FastOperand, u64)> {
+    match (kind, lhs, rhs) {
+        (FastBinaryOp::Add, _, FastOperand::Immediate(value)) => Some((lhs, value)),
+        (FastBinaryOp::Add, FastOperand::Immediate(value), _) => Some((rhs, value)),
+        (FastBinaryOp::Subtract, _, FastOperand::Immediate(value)) => Some((lhs, value)),
+        _ => None,
     }
 }
 
@@ -237,14 +270,19 @@ fn emit(
             };
             match (fast, fast_operand(lhs, types), fast_operand(rhs, types)) {
                 (Some(kind), Some(lhs), Some(rhs)) => {
-                    assembler.binary_fast(
+                    // The fast path always yields a `Uint64`, so when the
+                    // destination already holds one its tag byte is correct
+                    // and only the payload word needs writing.
+                    let write_tag = types.get(*dst) != ValueType::Uint64;
+                    assembler.binary_fast(FastBinary {
                         kind,
                         lhs,
                         rhs,
-                        slot(*dst),
-                        helper::binary_values as *const (),
-                        data,
-                    );
+                        destination: slot(*dst),
+                        helper: helper::binary_values as *const (),
+                        op: data,
+                        write_tag,
+                    });
                 }
                 _ => assembler.call(helper::binary_values as *const (), &[data]),
             }
