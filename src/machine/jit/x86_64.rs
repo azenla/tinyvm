@@ -1,17 +1,22 @@
 use super::{FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET};
 use crate::machine::error::{MachineError, Result};
 
-// Register conventions for generated code: rbx holds the machine state
-// pointer, r12 the entry table base (both callee-saved), and rax is scratch
-// for helper addresses. Argument registers differ between the System V and
-// Windows x64 calling conventions.
+// Register conventions for generated code: rbx holds the machine state pointer,
+// r12 the entry table base (both callee-saved), rax/rcx are operand scratch,
+// and dl the tag scratch. r13/r14/r15/rbp are handed to the register allocator
+// to pin hot VM registers (callee-saved, so they survive helper calls). Helper
+// argument registers differ between the System V and Windows x64 conventions.
 //
-// The frame keeps rsp 16-byte aligned at every call site; Windows
-// additionally requires 32 bytes of shadow space above rsp.
+// The frame keeps rsp 16-byte aligned at every call site; Windows additionally
+// requires 32 bytes of shadow space above rsp. Each pinned register is pushed
+// (8 bytes), so an odd count is padded with 8 extra frame bytes to preserve
+// alignment.
+const STATE: u8 = 3; // rbx (r12 holds the entry table, addressed inline)
+
 #[cfg(windows)]
-const FRAME: u8 = 40;
+const FRAME_BASE: u8 = 40;
 #[cfg(not(windows))]
-const FRAME: u8 = 8;
+const FRAME_BASE: u8 = 8;
 
 enum FixupTarget {
     Op(usize),
@@ -34,30 +39,22 @@ pub(super) struct Assembler {
     fixups: Vec<Fixup>,
     table: usize,
     epilogue_offset: usize,
+    /// The `(cpu register, state slot)` pair for each pinned VM register.
+    pinned: Vec<(u32, usize)>,
 }
 
 impl Assembler {
-    // Register pinning is not yet wired up on x86_64, so no VM register is
-    // kept in a CPU register: every operand is read from and written to the
-    // memory bank, exactly as before.
-    pub(super) const PIN_REGISTERS: &'static [u32] = &[];
+    pub(super) const PIN_REGISTERS: &'static [u32] = &[13, 14, 15, 5]; // r13, r14, r15, rbp
 
-    pub(super) fn new(table: usize, _pinned: Vec<(u32, usize)>) -> Self {
+    pub(super) fn new(table: usize, pinned: Vec<(u32, usize)>) -> Self {
         Self {
             code: Vec::new(),
             fixups: Vec::new(),
             table,
             epilogue_offset: 0,
+            pinned,
         }
     }
-
-    /// No registers are pinned on x86_64, so there is nothing cached to
-    /// refresh after a helper writes the bank.
-    pub(super) fn reload_pinned(&mut self) {}
-
-    /// Unreached on x86_64: destinations are never pinned, so a copy never
-    /// needs to reload a cached register.
-    pub(super) fn reload_one(&mut self, _register: u32, _slot: usize) {}
 
     pub(super) fn offset(&self) -> usize {
         self.code.len()
@@ -65,6 +62,12 @@ impl Assembler {
 
     fn bytes(&mut self, bytes: &[u8]) {
         self.code.extend_from_slice(bytes);
+    }
+
+    /// Frame size that keeps rsp 16-byte aligned at call sites given the pushed
+    /// callee-saved registers (rbx, r12, and the pinned set).
+    fn frame(&self) -> u8 {
+        FRAME_BASE + if self.pinned.len() % 2 == 1 { 8 } else { 0 }
     }
 
     fn branch_fixup(&mut self, opcode: &[u8], target: FixupTarget) {
@@ -76,9 +79,81 @@ impl Assembler {
         self.bytes(&[0; 4]);
     }
 
+    /// A REX.W prefix carrying the high bits of the ModRM `reg` and `rm` fields.
+    fn rex(&mut self, reg: u8, rm: u8) {
+        self.bytes(&[0x48 | (((reg >> 3) & 1) << 2) | ((rm >> 3) & 1)]);
+    }
+
     fn move_immediate(&mut self, rex: u8, register: u8, value: u64) {
         self.bytes(&[rex, 0xB8 + register]); // mov r64, imm64
         self.bytes(&value.to_le_bytes());
+    }
+
+    /// `mov register, imm64` for any register.
+    fn move_immediate_register(&mut self, register: u8, value: u64) {
+        self.rex(0, register);
+        self.bytes(&[0xB8 + (register & 7)]);
+        self.bytes(&value.to_le_bytes());
+    }
+
+    /// `mov register, [rbx + byte_offset]` for any register.
+    fn load(&mut self, register: u8, byte_offset: usize) {
+        self.rex(register, STATE);
+        self.bytes(&[0x8B, 0x80 | ((register & 7) << 3) | (STATE & 7)]);
+        self.bytes(&(byte_offset as i32).to_le_bytes());
+    }
+
+    /// `mov [rbx + byte_offset], register` for any register.
+    fn store(&mut self, register: u8, byte_offset: usize) {
+        self.rex(register, STATE);
+        self.bytes(&[0x89, 0x80 | ((register & 7) << 3) | (STATE & 7)]);
+        self.bytes(&(byte_offset as i32).to_le_bytes());
+    }
+
+    fn move_register(&mut self, destination: u8, source: u8) {
+        self.rex(source, destination);
+        self.bytes(&[0x89, 0xC0 | ((source & 7) << 3) | (destination & 7)]);
+    }
+
+    fn add_registers(&mut self, destination: u8, source: u8) {
+        self.rex(source, destination);
+        self.bytes(&[0x01, 0xC0 | ((source & 7) << 3) | (destination & 7)]);
+    }
+
+    fn subtract_registers(&mut self, destination: u8, source: u8) {
+        self.rex(source, destination);
+        self.bytes(&[0x29, 0xC0 | ((source & 7) << 3) | (destination & 7)]);
+    }
+
+    fn multiply_registers(&mut self, destination: u8, source: u8) {
+        self.rex(destination, source);
+        self.bytes(&[0x0F, 0xAF, 0xC0 | ((destination & 7) << 3) | (source & 7)]);
+    }
+
+    fn add_immediate(&mut self, destination: u8, value: u32) {
+        self.rex(0, destination);
+        self.bytes(&[0x81, 0xC0 | (destination & 7)]); // /0
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn subtract_immediate(&mut self, destination: u8, value: u32) {
+        self.rex(0, destination);
+        self.bytes(&[0x81, 0xE8 | (destination & 7)]); // /5
+        self.bytes(&value.to_le_bytes());
+    }
+
+    fn push_reg(&mut self, register: u8) {
+        if register >= 8 {
+            self.bytes(&[0x41]);
+        }
+        self.bytes(&[0x50 + (register & 7)]);
+    }
+
+    fn pop_reg(&mut self, register: u8) {
+        if register >= 8 {
+            self.bytes(&[0x41]);
+        }
+        self.bytes(&[0x58 + (register & 7)]);
     }
 
     fn test_status(&mut self) {
@@ -89,18 +164,27 @@ impl Assembler {
         self.branch_fixup(&[0x0F, 0x88], FixupTarget::Epilogue); // js
     }
 
-    /// Entered as `function(state, entry)`; jumps into the generated body at
-    /// `entry` once the frame and pinned registers are established.
+    /// Entered as `function(state, entry)`; establishes the frame and pinned
+    /// registers, loads the pinned VM registers from the bank, then jumps into
+    /// the generated body at `entry`.
     pub(super) fn prologue(&mut self) {
         let table = self.table as u64;
+        let pinned = self.pinned.clone();
+        let frame = self.frame();
         self.bytes(&[0x53]); // push rbx
         self.bytes(&[0x41, 0x54]); // push r12
-        self.bytes(&[0x48, 0x83, 0xEC, FRAME]); // sub rsp, FRAME
+        for (register, _) in &pinned {
+            self.push_reg(*register as u8);
+        }
+        self.bytes(&[0x48, 0x83, 0xEC, frame]); // sub rsp, frame
         #[cfg(windows)]
         self.bytes(&[0x48, 0x89, 0xCB]); // mov rbx, rcx
         #[cfg(not(windows))]
         self.bytes(&[0x48, 0x89, 0xFB]); // mov rbx, rdi
         self.move_immediate(0x49, 4, table); // mov r12, table
+        for (register, slot) in &pinned {
+            self.load(*register as u8, slot + PAYLOAD_OFFSET);
+        }
         #[cfg(windows)]
         self.bytes(&[0xFF, 0xE2]); // jmp rdx
         #[cfg(not(windows))]
@@ -109,10 +193,38 @@ impl Assembler {
 
     pub(super) fn epilogue(&mut self) {
         self.epilogue_offset = self.code.len();
-        self.bytes(&[0x48, 0x83, 0xC4, FRAME]); // add rsp, FRAME
+        let pinned = self.pinned.clone();
+        let frame = self.frame();
+        self.bytes(&[0x48, 0x83, 0xC4, frame]); // add rsp, frame
+        for (register, _) in pinned.iter().rev() {
+            self.pop_reg(*register as u8);
+        }
         self.bytes(&[0x41, 0x5C]); // pop r12
         self.bytes(&[0x5B]); // pop rbx
         self.bytes(&[0xC3]); // ret
+    }
+
+    /// Writes every pinned register's payload back to its bank slot, making the
+    /// bank coherent for the helper a call is about to enter.
+    fn spill_pinned(&mut self) {
+        let pinned = self.pinned.clone();
+        for (register, slot) in &pinned {
+            self.store(*register as u8, slot + PAYLOAD_OFFSET);
+        }
+    }
+
+    /// Reloads every pinned register from its bank slot: used after a helper
+    /// wrote the bank directly, leaving the CPU registers stale.
+    pub(super) fn reload_pinned(&mut self) {
+        let pinned = self.pinned.clone();
+        for (register, slot) in &pinned {
+            self.load(*register as u8, slot + PAYLOAD_OFFSET);
+        }
+    }
+
+    /// Reloads a single pinned register from its slot.
+    pub(super) fn reload_one(&mut self, register: u32, slot: usize) {
+        self.load(register as u8, slot + PAYLOAD_OFFSET);
     }
 
     pub(super) fn call(&mut self, function: *const (), args: &[u64]) {
@@ -121,6 +233,10 @@ impl Assembler {
         #[cfg(not(windows))]
         const ARGUMENTS: [(u8, u8); 2] = [(0x48, 6), (0x48, 2)]; // rsi, rdx
 
+        // The helper reads and writes the bank directly, so flush the pinned
+        // registers' payloads to it first; callers reload afterward if the
+        // helper may have written the bank.
+        self.spill_pinned();
         #[cfg(windows)]
         self.bytes(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
         #[cfg(not(windows))]
@@ -179,47 +295,49 @@ impl Assembler {
         self.code[position..position + 4].copy_from_slice(&relative.to_le_bytes());
     }
 
-    /// Emits a ModRM byte and 32-bit displacement addressing `[rbx + disp]`.
+    /// Emits a ModRM byte and 32-bit displacement addressing `[rbx + disp]`,
+    /// for a low register (`rax`/`rcx`/`rdx`) in the `reg` field.
     fn memory(&mut self, register: u8, displacement: i32) {
         self.bytes(&[0x83 | (register << 3)]);
         self.bytes(&displacement.to_le_bytes());
     }
 
-    /// Loads an operand's payload into `register` (0 = rax, 1 = rcx). Checked
-    /// operands are verified for the `Uint64` tag first — a failed check
-    /// branches to the pending slow path — while trusted operands were proven
-    /// `Uint64` by the optimizer and skip the check. `pin` is always `None`
-    /// here, so trusted registers are read from the memory bank.
-    fn load_operand(
-        &mut self,
-        operand: FastOperand,
-        register: u8,
-        checks: &mut Vec<PendingBranch>,
-    ) {
+    /// Loads an operand's payload into `target` (0 = rax, 1 = rcx): a pinned
+    /// register is moved in, a trusted slot loaded from memory, a checked slot
+    /// loaded after a `Uint64` tag check whose failure branches to the pending
+    /// slow path, or an immediate materialized.
+    fn operand_into(&mut self, operand: FastOperand, target: u8, checks: &mut Vec<PendingBranch>) {
         match operand {
+            FastOperand::Trusted {
+                pin: Some(register),
+                ..
+            } => {
+                let register = register as u8;
+                if register != target {
+                    self.move_register(target, register);
+                }
+            }
+            FastOperand::Trusted { slot, pin: None } => self.load(target, slot + PAYLOAD_OFFSET),
             FastOperand::Checked { slot } => {
                 self.bytes(&[0x0F, 0xB6]); // movzx edx, byte [rbx + slot]
                 self.memory(2, slot as i32);
                 self.bytes(&[0x80, 0xFA, super::uint64_tag()]); // cmp dl, tag
                 checks.push(self.forward(&[0x0F, 0x85])); // jne slow
-                self.bytes(&[0x48, 0x8B]); // mov register, [rbx + payload]
-                self.memory(register, (slot + PAYLOAD_OFFSET) as i32);
+                self.load(target, slot + PAYLOAD_OFFSET);
             }
-            FastOperand::Trusted { slot, .. } => {
-                self.bytes(&[0x48, 0x8B]); // mov register, [rbx + payload]
-                self.memory(register, (slot + PAYLOAD_OFFSET) as i32);
-            }
-            FastOperand::Immediate(value) => self.move_immediate(0x48, register, value),
+            FastOperand::Immediate(value) => self.move_immediate_register(target, value),
         }
     }
 
-    /// Writes the `Uint64` in rax through to the destination slot's payload,
-    /// plus a whole tag word when the slot did not already hold a `Uint64`.
-    /// Destinations are never pinned on x86_64, so this is the only place the
-    /// result lands.
+    /// Records the result of a fast-path write, which is in rax. A memory
+    /// destination's only home is its slot, so the payload is stored there. A
+    /// pinned destination already holds the payload in its CPU register
+    /// (spilled at call boundaries), so only the tag is written through, and
+    /// only when the slot did not already hold a `Uint64`.
     fn store_through(&mut self, destination: &FastDest, write_tag: bool) {
-        self.bytes(&[0x48, 0x89]); // mov [rbx + payload], rax
-        self.memory(0, (destination.slot + PAYLOAD_OFFSET) as i32);
+        if destination.pin.is_none() {
+            self.store(0, destination.slot + PAYLOAD_OFFSET); // mov [rbx + payload], rax
+        }
         if write_tag {
             self.bytes(&[0x48, 0xC7]); // mov qword [rbx + slot], tag
             self.memory(0, destination.slot as i32);
@@ -255,21 +373,25 @@ impl Assembler {
         if let Some((base, value)) = super::immediate_form(kind, lhs, rhs)
             && value <= i32::MAX as u64
         {
-            self.load_operand(base, 0, &mut checks);
+            self.operand_into(base, 0, &mut checks); // rax
             match kind {
-                FastBinaryOp::Add => self.bytes(&[0x48, 0x05]), // add rax, imm32
-                FastBinaryOp::Subtract => self.bytes(&[0x48, 0x2D]), // sub rax, imm32
+                FastBinaryOp::Add => self.add_immediate(0, value as u32),
+                FastBinaryOp::Subtract => self.subtract_immediate(0, value as u32),
                 FastBinaryOp::Multiply => unreachable!(),
             }
-            self.bytes(&(value as u32).to_le_bytes());
         } else {
-            self.load_operand(lhs, 0, &mut checks);
-            self.load_operand(rhs, 1, &mut checks);
+            self.operand_into(lhs, 0, &mut checks); // rax
+            self.operand_into(rhs, 1, &mut checks); // rcx
             match kind {
-                FastBinaryOp::Add => self.bytes(&[0x48, 0x01, 0xC8]), // add rax, rcx
-                FastBinaryOp::Subtract => self.bytes(&[0x48, 0x29, 0xC8]), // sub rax, rcx
-                FastBinaryOp::Multiply => self.bytes(&[0x48, 0x0F, 0xAF, 0xC1]), // imul rax, rcx
+                FastBinaryOp::Add => self.add_registers(0, 1), // rax += rcx
+                FastBinaryOp::Subtract => self.subtract_registers(0, 1), // rax -= rcx
+                FastBinaryOp::Multiply => self.multiply_registers(0, 1), // rax *= rcx
             }
+        }
+        // The result is in rax; a pinned destination also keeps it in its
+        // register, spilled to the bank only at call boundaries.
+        if let Some(register) = dst.pin {
+            self.move_register(register as u8, 0);
         }
         self.store_through(&dst, write_tag);
         self.slow_path(checks, |assembler| {
@@ -278,8 +400,9 @@ impl Assembler {
         });
     }
 
-    /// Copies a proven `Uint64` payload from `source` to `destination` through
-    /// the memory bank (destinations are never pinned on x86_64).
+    /// Copies a proven `Uint64` payload from `source` to `destination`, keeping
+    /// it in the destination's pinned register when it has one and writing it
+    /// through to the slot otherwise.
     pub(super) fn copy_register(
         &mut self,
         source: FastOperand,
@@ -287,8 +410,11 @@ impl Assembler {
         write_tag: bool,
     ) {
         let mut checks = Vec::new();
-        self.load_operand(source, 0, &mut checks); // into rax
+        self.operand_into(source, 0, &mut checks); // rax
         debug_assert!(checks.is_empty(), "a proven source never needs a tag check");
+        if let Some(register) = destination.pin {
+            self.move_register(register as u8, 0);
+        }
         self.store_through(&destination, write_tag);
     }
 
@@ -319,7 +445,7 @@ impl Assembler {
         op: u64,
     ) {
         let mut checks = Vec::new();
-        self.load_operand(source, 0, &mut checks);
+        self.operand_into(source, 0, &mut checks); // rax
         self.test_status();
         self.branch_fixup(&[0x0F, 0x84], FixupTarget::Op(target)); // jz
         self.slow_path(checks, |assembler| {
@@ -337,8 +463,8 @@ impl Assembler {
         op: u64,
     ) {
         let mut checks = Vec::new();
-        self.load_operand(lhs, 0, &mut checks);
-        self.load_operand(rhs, 1, &mut checks);
+        self.operand_into(lhs, 0, &mut checks); // rax
+        self.operand_into(rhs, 1, &mut checks); // rcx
         self.bytes(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
         self.branch_fixup(&[0x0F, 0x84], FixupTarget::Op(target)); // je
         self.slow_path(checks, |assembler| {

@@ -106,6 +106,51 @@ fn slow_path_reloads_pinned_destination() {
     }
 }
 
+// An odd number of pinned registers pads the saved-register area for
+// alignment (x86_64) and pairs a register with the zero register (aarch64).
+// Popping then pushing three Uint64 registers pins three of them and routes
+// every access through a helper, exercising that padding plus the
+// spill-before-call and reload-after-call paths.
+#[test]
+fn odd_pin_count_round_trips_through_helpers() {
+    use crate::machine::optimizer::{OptimizedProgram, ValueType};
+
+    static PROGRAM: RawProgram = program!(
+        op!(Pop, Register1),
+        op!(Pop, Register2),
+        op!(Pop, Register3),
+        op!(Push, Register1),
+        op!(Push, Register2),
+        op!(Push, Register3),
+        op!(Exit),
+    );
+
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
+    let optimized = OptimizedProgram::compile_with_inputs(
+        &intermediate,
+        &[ValueType::Uint64, ValueType::Uint64, ValueType::Uint64],
+    );
+    let jit = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
+    let interpreted = MachineProgram::Intermediate(intermediate);
+
+    let mut jitted = Machine::new(ops::all());
+    let mut interpreter = Machine::new(ops::all());
+    for value in [10u64, 20, 30] {
+        jitted.state().push(MachineValue::Uint64(value));
+        interpreter.state().push(MachineValue::Uint64(value));
+    }
+    jitted.run(&jit).unwrap();
+    interpreter.run(&interpreted).unwrap();
+
+    for _ in 0..3 {
+        assert_eq!(
+            jitted.state().pop().unwrap(),
+            interpreter.state().pop().unwrap()
+        );
+    }
+    assert_eq!(jitted.state().bank(), interpreter.state().bank());
+}
+
 // A jump-if-zero on a constant compiles to static control flow: a bare jump
 // when the constant is zero, a fall-through when it is not.
 #[test]
