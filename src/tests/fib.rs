@@ -91,3 +91,41 @@ fn runs_jit_optimized() {
     let value = run_fib_program(ops::all(), program);
     assert_eq!(value, MachineValue::Uint64(832040));
 }
+
+// The optimized jit pins hot registers into CPU registers; its result and its
+// final register bank must match the interpreter for every input, including
+// fib(0), whose loop never runs and so never writes the pinned scratch
+// register, and inputs large enough to wrap `u64`.
+#[cfg(all(
+    any(unix, windows),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn jit_optimized_matches_interpreter() {
+    use crate::machine::jit::JitProgram;
+    use crate::machine::optimizer::{OptimizedProgram, ValueType};
+
+    let intermediate = IntermediateProgram::compile(&constants::FIB_PROGRAM).unwrap();
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
+    let jit = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
+    let interpreted = MachineProgram::Intermediate(intermediate);
+
+    for input in [0u64, 1, 2, 3, 10, 30, 90, 100, 200, 1_000_000] {
+        let mut jitted = Machine::new(ops::all());
+        jitted.state().push(MachineValue::Uint64(input));
+        jitted.run(&jit).unwrap();
+
+        let mut interpreter = Machine::new(ops::all());
+        interpreter.state().push(MachineValue::Uint64(input));
+        interpreter.run(&interpreted).unwrap();
+
+        let jit_result = jitted.state().pop().unwrap();
+        let interpreter_result = interpreter.state().pop().unwrap();
+        assert_eq!(jit_result, interpreter_result, "result mismatch for input {input}");
+        assert_eq!(
+            jitted.state().bank(),
+            interpreter.state().bank(),
+            "register bank mismatch for input {input}"
+        );
+    }
+}

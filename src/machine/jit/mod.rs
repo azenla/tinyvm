@@ -2,7 +2,7 @@ use crate::machine::MachineState;
 use crate::machine::error::{MachineError, Result};
 use crate::machine::intermediate::{BinaryOpKind, IntermediateOp, IntermediateProgram, Source};
 use crate::machine::optimizer::{OptimizedProgram, RegisterTypes, ValueType};
-use crate::machine::registers::RegisterBank;
+use crate::machine::registers::{REGISTER_BANK_COUNT, RegisterBank};
 use crate::machine::value::MachineValue;
 use std::sync::Arc;
 
@@ -35,15 +35,28 @@ pub(super) fn uint64_tag() -> u8 {
     unsafe { *(&value as *const MachineValue as *const u8) }
 }
 
-/// An operand a fast path can evaluate without calling a helper: a register
-/// slot checked for the `Uint64` tag at run time, a register slot the
-/// optimizer proved holds a `Uint64` and needs no check, or a `Uint64`
-/// immediate.
+/// An operand a fast path can evaluate without calling a helper.
 #[derive(Clone, Copy)]
 pub(super) enum FastOperand {
-    Register(usize),
-    TrustedRegister(usize),
+    /// A register the optimizer proved holds a `Uint64`, needing no tag check.
+    /// `pin` names the CPU register caching its payload; otherwise the payload
+    /// is loaded from `slot`.
+    Trusted { slot: usize, pin: Option<u32> },
+    /// A register of unproven type: its tag is checked at run time and its
+    /// payload loaded from `slot`. Never pinned — read straight from memory.
+    Checked { slot: usize },
+    /// A `Uint64` immediate.
     Immediate(u64),
+}
+
+/// The destination of a fast-path write. The payload is always written through
+/// to `slot` so the memory bank stays coherent for helpers and unproven reads;
+/// when the register is pinned the value additionally lives in `pin`'s CPU
+/// register, where proven reads pick it up without touching memory.
+#[derive(Clone, Copy)]
+pub(super) struct FastDest {
+    pub slot: usize,
+    pub pin: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -53,15 +66,15 @@ pub(super) enum FastBinaryOp {
     Multiply,
 }
 
-/// A binary op lowered to a fast path: the operation and operands, the slot to
-/// store into, and the `helper`/`op` pair called when a run-time tag check
+/// A binary op lowered to a fast path: the operation and operands, the
+/// destination, and the `helper`/`op` pair called when a run-time tag check
 /// fails. `write_tag` is false when the destination already holds a `Uint64`,
 /// so only the payload word needs writing.
 pub(super) struct FastBinary {
     pub kind: FastBinaryOp,
     pub lhs: FastOperand,
     pub rhs: FastOperand,
-    pub destination: usize,
+    pub dst: FastDest,
     pub helper: *const (),
     pub op: u64,
     pub write_tag: bool,
@@ -72,22 +85,128 @@ fn slot(index: usize) -> usize {
     std::mem::offset_of!(MachineState, bank) + RegisterBank::slot_offset(index)
 }
 
-/// The operand form of a register slot: trusted when the optimizer proved
-/// the register holds a `Uint64`, tag-checked at run time otherwise.
-fn register_operand(index: usize, types: &RegisterTypes) -> FastOperand {
+fn pin_of(index: usize, pins: &[Option<u32>]) -> Option<u32> {
+    pins.get(index).copied().flatten()
+}
+
+/// The operand form of a register slot: trusted (and pinned when the allocator
+/// gave it a CPU register) when the optimizer proved the register holds a
+/// `Uint64`, tag-checked at run time otherwise.
+fn register_operand(index: usize, types: &RegisterTypes, pins: &[Option<u32>]) -> FastOperand {
     if types.get(index) == ValueType::Uint64 {
-        FastOperand::TrustedRegister(slot(index))
+        FastOperand::Trusted {
+            slot: slot(index),
+            pin: pin_of(index, pins),
+        }
     } else {
-        FastOperand::Register(slot(index))
+        FastOperand::Checked { slot: slot(index) }
     }
 }
 
-fn fast_operand(source: &Source, types: &RegisterTypes) -> Option<FastOperand> {
+fn fast_operand(source: &Source, types: &RegisterTypes, pins: &[Option<u32>]) -> Option<FastOperand> {
     match source {
-        Source::Register(index) => Some(register_operand(*index, types)),
+        Source::Register(index) => Some(register_operand(*index, types, pins)),
         Source::Value(MachineValue::Uint64(value)) => Some(FastOperand::Immediate(*value)),
         Source::Value(_) => None,
     }
+}
+
+fn dest(index: usize, pins: &[Option<u32>]) -> FastDest {
+    FastDest {
+        slot: slot(index),
+        pin: pin_of(index, pins),
+    }
+}
+
+/// Assigns pinned CPU registers to the most-used VM registers the analysis
+/// proves stay `Uint64`. A register is eligible when its inferred type is
+/// `Uint64` or `Unknown` at every op (never another concrete type), it is
+/// genuinely used as a `Uint64` somewhere, and every copy into it draws from a
+/// proven `Uint64` source. Those conditions let its CPU register hold a bare
+/// payload while the memory slot's tag stays `Uint64`. Returns the chosen
+/// `(register index, cpu register)` pairs, at most `registers.len()` of them.
+fn allocate(
+    ops: &[IntermediateOp],
+    types: &[RegisterTypes],
+    registers: &[u32],
+) -> Vec<(usize, u32)> {
+    let type_at = |pc: usize, index: usize| {
+        types
+            .get(pc)
+            .map(|t| t.get(index))
+            .unwrap_or(ValueType::Unknown)
+    };
+
+    let mut eligible = [true; REGISTER_BANK_COUNT];
+    let mut uint64_seen = [false; REGISTER_BANK_COUNT];
+    let mut usage = [0usize; REGISTER_BANK_COUNT];
+
+    for index in 0..REGISTER_BANK_COUNT {
+        for pc in 0..ops.len() {
+            match type_at(pc, index) {
+                ValueType::Uint64 => uint64_seen[index] = true,
+                ValueType::Unknown => {}
+                _ => eligible[index] = false,
+            }
+        }
+    }
+
+    for (pc, op) in ops.iter().enumerate() {
+        match op {
+            IntermediateOp::PushRegister(index) | IntermediateOp::PopRegister(index) => {
+                usage[*index] += 1;
+            }
+            IntermediateOp::Binary { lhs, rhs, dst, .. } => {
+                if let Source::Register(index) = lhs {
+                    usage[*index] += 1;
+                }
+                if let Source::Register(index) = rhs {
+                    usage[*index] += 1;
+                }
+                usage[*dst] += 1;
+            }
+            IntermediateOp::Copy { src, dst } => {
+                match src {
+                    Source::Register(index) => {
+                        usage[*index] += 1;
+                        // A copy from an unproven source would land a
+                        // possibly-non-`Uint64` value in the destination.
+                        if type_at(pc, *index) != ValueType::Uint64 {
+                            eligible[*dst] = false;
+                        }
+                    }
+                    Source::Value(MachineValue::Uint64(_)) => {}
+                    Source::Value(_) => eligible[*dst] = false,
+                }
+                usage[*dst] += 1;
+            }
+            IntermediateOp::JumpIfZeroValue {
+                src: Source::Register(index),
+                ..
+            } => {
+                usage[*index] += 1;
+            }
+            IntermediateOp::JumpIfEqualValues { lhs, rhs, .. } => {
+                if let Source::Register(index) = lhs {
+                    usage[*index] += 1;
+                }
+                if let Source::Register(index) = rhs {
+                    usage[*index] += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut candidates: Vec<usize> = (0..REGISTER_BANK_COUNT)
+        .filter(|&index| eligible[index] && uint64_seen[index] && usage[index] > 0)
+        .collect();
+    // Most-used first; ties broken by index so the choice is deterministic.
+    candidates.sort_by(|&a, &b| usage[b].cmp(&usage[a]).then(a.cmp(&b)));
+    candidates
+        .into_iter()
+        .zip(registers.iter().copied())
+        .collect()
 }
 
 /// Whether a binary op can be lowered as "base OP immediate", letting the
@@ -150,14 +269,25 @@ impl JitProgram {
         let ops: Box<[IntermediateOp]> = source.into();
         let mut entries: Box<[usize]> = vec![0; ops.len()].into();
 
-        let mut assembler = Assembler::new(entries.as_ptr() as usize);
+        // Decide which VM registers to keep in CPU registers, then record both
+        // the index-to-CPU-register map the emitter consults and the
+        // register/slot pairs the prologue loads and the epilogue trusts.
+        let assignment = allocate(&ops, types, Assembler::PIN_REGISTERS);
+        let mut pins = [None; REGISTER_BANK_COUNT];
+        let mut pinned = Vec::with_capacity(assignment.len());
+        for (index, register) in assignment {
+            pins[index] = Some(register);
+            pinned.push((register, slot(index)));
+        }
+
+        let mut assembler = Assembler::new(entries.as_ptr() as usize, pinned);
         assembler.prologue();
 
         let mut offsets = Vec::with_capacity(ops.len());
         for (pc, op) in ops.iter().enumerate() {
             offsets.push(assembler.offset());
-            let types = types.get(pc).copied().unwrap_or_default();
-            emit(&mut assembler, op, pc, ops.len(), &types);
+            let op_types = types.get(pc).copied().unwrap_or_default();
+            emit(&mut assembler, op, pc, ops.len(), &op_types, &pins);
         }
 
         let overflow = assembler.offset();
@@ -202,6 +332,7 @@ fn emit(
     pc: usize,
     length: usize,
     types: &RegisterTypes,
+    pins: &[Option<u32>],
 ) {
     let data = op as *const IntermediateOp as u64;
     let position = pc as u64;
@@ -215,6 +346,9 @@ fn emit(
         IntermediateOp::PopRegister(_) => {
             assembler.call(helper::pop_register as *const (), &[data, position]);
             assembler.check_error();
+            // The helper wrote the bank directly, so refresh any pinned
+            // register it may have overwritten from memory.
+            assembler.reload_pinned();
         }
         IntermediateOp::Add
         | IntermediateOp::Subtract
@@ -268,7 +402,7 @@ fn emit(
                 // division, not a hardware trap.
                 BinaryOpKind::Divide | BinaryOpKind::Remainder => None,
             };
-            match (fast, fast_operand(lhs, types), fast_operand(rhs, types)) {
+            match (fast, fast_operand(lhs, types, pins), fast_operand(rhs, types, pins)) {
                 (Some(kind), Some(lhs), Some(rhs)) => {
                     // The fast path always yields a `Uint64`, so when the
                     // destination already holds one its tag byte is correct
@@ -278,7 +412,7 @@ fn emit(
                         kind,
                         lhs,
                         rhs,
-                        destination: slot(*dst),
+                        dst: dest(*dst, pins),
                         helper: helper::binary_values as *const (),
                         op: data,
                         write_tag,
@@ -287,19 +421,46 @@ fn emit(
                 _ => assembler.call(helper::binary_values as *const (), &[data]),
             }
         }
-        IntermediateOp::Copy { src, dst } => match src {
-            Source::Register(index) => assembler.copy_slot(slot(*index), slot(*dst)),
-            Source::Value(value) => {
-                assembler.copy_constant(value as *const MachineValue as usize, slot(*dst));
+        IntermediateOp::Copy { src, dst } => {
+            let destination = dest(*dst, pins);
+            // The result takes the source's type, so the tag needs writing
+            // only when the destination did not already hold a `Uint64`.
+            let write_tag = types.get(*dst) != ValueType::Uint64;
+            match src {
+                // A proven `Uint64` source (register or immediate) is a payload
+                // move, kept in the destination's CPU register and written
+                // through to its slot.
+                Source::Register(index) if types.get(*index) == ValueType::Uint64 => {
+                    let source = register_operand(*index, types, pins);
+                    assembler.copy_register(source, destination, write_tag);
+                }
+                Source::Value(MachineValue::Uint64(value)) => {
+                    assembler.copy_register(FastOperand::Immediate(*value), destination, write_tag);
+                }
+                // Any other source may not be a `Uint64`, so the whole slot is
+                // copied through memory; a pinned destination is refreshed
+                // from the slot afterward.
+                Source::Register(index) => {
+                    assembler.copy_slot(slot(*index), destination.slot);
+                    if let Some(register) = destination.pin {
+                        assembler.reload_one(register, destination.slot);
+                    }
+                }
+                Source::Value(value) => {
+                    assembler.copy_constant(value as *const MachineValue as usize, destination.slot);
+                    if let Some(register) = destination.pin {
+                        assembler.reload_one(register, destination.slot);
+                    }
+                }
             }
-        },
+        }
         IntermediateOp::JumpIfEqualValues { lhs, rhs, target } => {
             if let (Source::Value(lhs), Source::Value(rhs)) = (lhs, rhs) {
                 if rhs == lhs {
                     assembler.jump(*target);
                 }
             } else if let (Some(lhs), Some(rhs)) =
-                (fast_operand(lhs, types), fast_operand(rhs, types))
+                (fast_operand(lhs, types, pins), fast_operand(rhs, types, pins))
             {
                 assembler.jump_if_equal_fast(
                     lhs,
@@ -315,7 +476,7 @@ fn emit(
         }
         IntermediateOp::JumpIfZeroValue { src, target } => match src {
             Source::Register(index) => assembler.jump_if_zero_fast(
-                register_operand(*index, types),
+                register_operand(*index, types, pins),
                 *target,
                 helper::jump_if_zero_values as *const (),
                 data,

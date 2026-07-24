@@ -1,4 +1,4 @@
-use super::{FastBinary, FastBinaryOp, FastOperand, PAYLOAD_OFFSET};
+use super::{FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET};
 use crate::machine::error::{MachineError, Result};
 
 // Register conventions for generated code: rbx holds the machine state
@@ -37,7 +37,12 @@ pub(super) struct Assembler {
 }
 
 impl Assembler {
-    pub(super) fn new(table: usize) -> Self {
+    // Register pinning is not yet wired up on x86_64, so no VM register is
+    // kept in a CPU register: every operand is read from and written to the
+    // memory bank, exactly as before.
+    pub(super) const PIN_REGISTERS: &'static [u32] = &[];
+
+    pub(super) fn new(table: usize, _pinned: Vec<(u32, usize)>) -> Self {
         Self {
             code: Vec::new(),
             fixups: Vec::new(),
@@ -45,6 +50,14 @@ impl Assembler {
             epilogue_offset: 0,
         }
     }
+
+    /// No registers are pinned on x86_64, so there is nothing cached to
+    /// refresh after a helper writes the bank.
+    pub(super) fn reload_pinned(&mut self) {}
+
+    /// Unreached on x86_64: destinations are never pinned, so a copy never
+    /// needs to reload a cached register.
+    pub(super) fn reload_one(&mut self, _register: u32, _slot: usize) {}
 
     pub(super) fn offset(&self) -> usize {
         self.code.len()
@@ -172,10 +185,11 @@ impl Assembler {
         self.bytes(&displacement.to_le_bytes());
     }
 
-    /// Loads an operand's payload into `register` (0 = rax, 1 = rcx).
-    /// Register operands are checked for the `Uint64` tag first — a failed
-    /// check branches to the pending slow path — while trusted registers
-    /// were proven `Uint64` by the optimizer and skip the check.
+    /// Loads an operand's payload into `register` (0 = rax, 1 = rcx). Checked
+    /// operands are verified for the `Uint64` tag first — a failed check
+    /// branches to the pending slow path — while trusted operands were proven
+    /// `Uint64` by the optimizer and skip the check. `pin` is always `None`
+    /// here, so trusted registers are read from the memory bank.
     fn load_operand(
         &mut self,
         operand: FastOperand,
@@ -183,7 +197,7 @@ impl Assembler {
         checks: &mut Vec<PendingBranch>,
     ) {
         match operand {
-            FastOperand::Register(slot) => {
+            FastOperand::Checked { slot } => {
                 self.bytes(&[0x0F, 0xB6]); // movzx edx, byte [rbx + slot]
                 self.memory(2, slot as i32);
                 self.bytes(&[0x80, 0xFA, super::uint64_tag()]); // cmp dl, tag
@@ -191,7 +205,7 @@ impl Assembler {
                 self.bytes(&[0x48, 0x8B]); // mov register, [rbx + payload]
                 self.memory(register, (slot + PAYLOAD_OFFSET) as i32);
             }
-            FastOperand::TrustedRegister(slot) => {
+            FastOperand::Trusted { slot, .. } => {
                 self.bytes(&[0x48, 0x8B]); // mov register, [rbx + payload]
                 self.memory(register, (slot + PAYLOAD_OFFSET) as i32);
             }
@@ -199,16 +213,16 @@ impl Assembler {
         }
     }
 
-    /// Stores the `Uint64` in rax to a register slot: the payload word, then
-    /// a whole tag word so the slot's padding stays defined. `write_tag` is
-    /// false when the slot already holds a `Uint64` tag, leaving only the
-    /// payload.
-    fn store_result(&mut self, destination: usize, write_tag: bool) {
+    /// Writes the `Uint64` in rax through to the destination slot's payload,
+    /// plus a whole tag word when the slot did not already hold a `Uint64`.
+    /// Destinations are never pinned on x86_64, so this is the only place the
+    /// result lands.
+    fn store_through(&mut self, destination: &FastDest, write_tag: bool) {
         self.bytes(&[0x48, 0x89]); // mov [rbx + payload], rax
-        self.memory(0, (destination + PAYLOAD_OFFSET) as i32);
+        self.memory(0, (destination.slot + PAYLOAD_OFFSET) as i32);
         if write_tag {
             self.bytes(&[0x48, 0xC7]); // mov qword [rbx + slot], tag
-            self.memory(0, destination as i32);
+            self.memory(0, destination.slot as i32);
             self.bytes(&u32::from(super::uint64_tag()).to_le_bytes());
         }
     }
@@ -230,7 +244,7 @@ impl Assembler {
             kind,
             lhs,
             rhs,
-            destination,
+            dst,
             helper,
             op,
             write_tag,
@@ -257,8 +271,25 @@ impl Assembler {
                 FastBinaryOp::Multiply => self.bytes(&[0x48, 0x0F, 0xAF, 0xC1]), // imul rax, rcx
             }
         }
-        self.store_result(destination, write_tag);
-        self.slow_path(checks, |assembler| assembler.call(helper, &[op]));
+        self.store_through(&dst, write_tag);
+        self.slow_path(checks, |assembler| {
+            assembler.call(helper, &[op]);
+            assembler.reload_pinned();
+        });
+    }
+
+    /// Copies a proven `Uint64` payload from `source` to `destination` through
+    /// the memory bank (destinations are never pinned on x86_64).
+    pub(super) fn copy_register(
+        &mut self,
+        source: FastOperand,
+        destination: FastDest,
+        write_tag: bool,
+    ) {
+        let mut checks = Vec::new();
+        self.load_operand(source, 0, &mut checks); // into rax
+        debug_assert!(checks.is_empty(), "a proven source never needs a tag check");
+        self.store_through(&destination, write_tag);
     }
 
     pub(super) fn copy_slot(&mut self, source: usize, destination: usize) {

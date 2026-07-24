@@ -1,13 +1,17 @@
-use super::{FastBinary, FastBinaryOp, FastOperand, PAYLOAD_OFFSET};
+use super::{FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET};
 use crate::machine::error::{MachineError, Result};
 
 // Register conventions for generated code: x19 holds the machine state
 // pointer, x20 the entry table base (both callee-saved), and x16 is the
-// intra-procedure scratch register used for helper addresses.
+// intra-procedure scratch register used for helper addresses. x0/x1 are
+// operand scratch and w2 the tag scratch; x21-x28 are handed to the register
+// allocator to pin hot VM registers (callee-saved, so they survive helper
+// calls untouched).
 const STATE: u32 = 19;
 const TABLE: u32 = 20;
 const SCRATCH: u32 = 16;
 const ARGUMENTS: [u32; 3] = [0, 1, 2];
+const ZERO_REGISTER: u32 = 31;
 
 enum FixupKind {
     Imm26,
@@ -37,15 +41,35 @@ pub(super) struct Assembler {
     fixups: Vec<Fixup>,
     table: usize,
     epilogue_offset: usize,
+    /// The `(cpu register, state slot)` pair for each pinned VM register.
+    pinned: Vec<(u32, usize)>,
+}
+
+/// Pairs pinned registers for `stp`/`ldp`, padding an odd count with the zero
+/// register so the stack stays 16-byte aligned.
+fn pin_pairs(pinned: &[(u32, usize)]) -> Vec<(u32, u32)> {
+    let registers: Vec<u32> = pinned.iter().map(|(register, _)| *register).collect();
+    let mut pairs = Vec::new();
+    let mut index = 0;
+    while index < registers.len() {
+        let first = registers[index];
+        let second = registers.get(index + 1).copied().unwrap_or(ZERO_REGISTER);
+        pairs.push((first, second));
+        index += 2;
+    }
+    pairs
 }
 
 impl Assembler {
-    pub(super) fn new(table: usize) -> Self {
+    pub(super) const PIN_REGISTERS: &'static [u32] = &[21, 22, 23, 24, 25, 26, 27, 28];
+
+    pub(super) fn new(table: usize, pinned: Vec<(u32, usize)>) -> Self {
         Self {
             code: Vec::new(),
             fixups: Vec::new(),
             table,
             epilogue_offset: 0,
+            pinned,
         }
     }
 
@@ -80,6 +104,42 @@ impl Assembler {
         self.word(0xAA00_03E0 | (source << 16) | destination); // orr rd, xzr, rm
     }
 
+    /// `ldr Xt, [x19, #byte_offset]` — a word-aligned load from the state.
+    fn load(&mut self, target: u32, byte_offset: usize) {
+        let scaled = (byte_offset / 8) as u32;
+        self.word(0xF940_0000 | (scaled << 10) | (STATE << 5) | target);
+    }
+
+    /// `str Xt, [x19, #byte_offset]`.
+    fn store(&mut self, source: u32, byte_offset: usize) {
+        let scaled = (byte_offset / 8) as u32;
+        self.word(0xF900_0000 | (scaled << 10) | (STATE << 5) | source);
+    }
+
+    fn add_registers(&mut self, destination: u32, lhs: u32, rhs: u32) {
+        self.word(0x8B00_0000 | (rhs << 16) | (lhs << 5) | destination);
+    }
+
+    fn subtract_registers(&mut self, destination: u32, lhs: u32, rhs: u32) {
+        self.word(0xCB00_0000 | (rhs << 16) | (lhs << 5) | destination);
+    }
+
+    fn multiply_registers(&mut self, destination: u32, lhs: u32, rhs: u32) {
+        self.word(0x9B00_7C00 | (rhs << 16) | (lhs << 5) | destination); // madd rd, rn, rm, xzr
+    }
+
+    fn add_immediate(&mut self, destination: u32, source: u32, value: u32) {
+        self.word(0x9100_0000 | (value << 10) | (source << 5) | destination);
+    }
+
+    fn subtract_immediate(&mut self, destination: u32, source: u32, value: u32) {
+        self.word(0xD100_0000 | (value << 10) | (source << 5) | destination);
+    }
+
+    fn compare_registers(&mut self, lhs: u32, rhs: u32) {
+        self.word(0xEB00_001F | (rhs << 16) | (lhs << 5)); // subs xzr, lhs, rhs
+    }
+
     fn compare_zero(&mut self) {
         self.word(0xF100_001F); // cmp x0, #0
     }
@@ -88,23 +148,51 @@ impl Assembler {
         self.branch_fixup(0x5400_000B, FixupKind::Imm19, FixupTarget::Epilogue); // b.lt
     }
 
-    /// Entered as `function(state: x0, entry: x1)`; jumps into the generated
-    /// body at `entry` once the frame and pinned registers are established.
+    /// Entered as `function(state: x0, entry: x1)`; establishes the frame and
+    /// pinned registers, loads the pinned VM registers from the bank, then
+    /// jumps into the generated body at `entry`.
     pub(super) fn prologue(&mut self) {
         let table = self.table as u64;
+        let pinned = self.pinned.clone();
         self.word(0xA9BF_7BFD); // stp x29, x30, [sp, #-16]!
         self.word(0x9100_03FD); // mov x29, sp
         self.word(0xA9BF_53F3); // stp x19, x20, [sp, #-16]!
-        self.move_register(STATE, 0);
+        for (first, second) in pin_pairs(&pinned) {
+            self.word(0xA9BF_03E0 | (second << 10) | first); // stp first, second, [sp, #-16]!
+        }
+        self.move_register(STATE, ARGUMENTS[0]);
         self.load_immediate(TABLE, table);
+        for (register, slot) in &pinned {
+            self.load(*register, slot + PAYLOAD_OFFSET);
+        }
         self.word(0xD61F_0020); // br x1
     }
 
     pub(super) fn epilogue(&mut self) {
         self.epilogue_offset = self.code.len();
+        let pinned = self.pinned.clone();
+        let mut pairs = pin_pairs(&pinned);
+        pairs.reverse();
+        for (first, second) in pairs {
+            self.word(0xA8C1_03E0 | (second << 10) | first); // ldp first, second, [sp], #16
+        }
         self.word(0xA8C1_53F3); // ldp x19, x20, [sp], #16
         self.word(0xA8C1_7BFD); // ldp x29, x30, [sp], #16
         self.word(0xD65F_03C0); // ret
+    }
+
+    /// Reloads every pinned register from its bank slot: used after a helper
+    /// wrote the bank directly, leaving the CPU registers stale.
+    pub(super) fn reload_pinned(&mut self) {
+        let pinned = self.pinned.clone();
+        for (register, slot) in &pinned {
+            self.load(*register, slot + PAYLOAD_OFFSET);
+        }
+    }
+
+    /// Reloads a single pinned register from its slot.
+    pub(super) fn reload_one(&mut self, register: u32, slot: usize) {
+        self.load(register, slot + PAYLOAD_OFFSET);
     }
 
     pub(super) fn call(&mut self, function: *const (), args: &[u64]) {
@@ -167,42 +255,49 @@ impl Assembler {
         self.code[position..position + 4].copy_from_slice(&patched.to_le_bytes());
     }
 
-    /// Loads an operand's payload into `register` (x0 or x1). Register
-    /// operands are checked for the `Uint64` tag first — a failed check
-    /// branches to the pending slow path — while trusted registers were
-    /// proven `Uint64` by the optimizer and skip the check.
-    fn load_operand(
+    /// Materializes an operand's payload into a CPU register and returns it: a
+    /// pinned register directly, a trusted slot loaded into `scratch`, a
+    /// tag-checked slot loaded into `scratch` after a `Uint64` check whose
+    /// failure branches to the pending slow path, or an immediate.
+    fn operand_register(
         &mut self,
         operand: FastOperand,
-        register: u32,
+        scratch: u32,
         checks: &mut Vec<PendingBranch>,
-    ) {
+    ) -> u32 {
         match operand {
-            FastOperand::Register(slot) => {
+            FastOperand::Trusted {
+                pin: Some(register),
+                ..
+            } => register,
+            FastOperand::Trusted { slot, pin: None } => {
+                self.load(scratch, slot + PAYLOAD_OFFSET);
+                scratch
+            }
+            FastOperand::Checked { slot } => {
                 let tag = u32::from(super::uint64_tag());
-                let payload = ((slot + PAYLOAD_OFFSET) / 8) as u32;
                 self.word(0x3940_0000 | ((slot as u32) << 10) | (STATE << 5) | 2); // ldrb w2, [x19, #slot]
                 self.word(0x7100_001F | (tag << 10) | (2 << 5)); // cmp w2, #tag
                 checks.push(self.forward(0x5400_0001, FixupKind::Imm19)); // b.ne slow
-                self.word(0xF940_0000 | (payload << 10) | (STATE << 5) | register); // ldr
+                self.load(scratch, slot + PAYLOAD_OFFSET);
+                scratch
             }
-            FastOperand::TrustedRegister(slot) => {
-                let payload = ((slot + PAYLOAD_OFFSET) / 8) as u32;
-                self.word(0xF940_0000 | (payload << 10) | (STATE << 5) | register); // ldr
+            FastOperand::Immediate(value) => {
+                self.load_immediate(scratch, value);
+                scratch
             }
-            FastOperand::Immediate(value) => self.load_immediate(register, value),
         }
     }
 
-    /// Stores the `Uint64` in x0 to a register slot: the payload word, then a
-    /// whole tag word so the slot's padding stays defined. `write_tag` is false
-    /// when the slot already holds a `Uint64` tag, leaving only the payload.
-    fn store_result(&mut self, destination: usize, write_tag: bool) {
-        let payload = ((destination + PAYLOAD_OFFSET) / 8) as u32;
-        self.word(0xF900_0000 | (payload << 10) | (STATE << 5)); // str x0, [x19, #payload]
+    /// Writes `register` through to the destination slot's payload — keeping
+    /// the memory bank coherent — plus a whole tag word when the slot did not
+    /// already hold a `Uint64`. The tag scratch (x1) never aliases a result
+    /// register, which is only x0 or a pinned register.
+    fn store_through(&mut self, destination: &FastDest, register: u32, write_tag: bool) {
+        self.store(register, destination.slot + PAYLOAD_OFFSET);
         if write_tag {
             self.load_immediate(1, u64::from(super::uint64_tag()));
-            self.word(0xF900_0000 | (((destination / 8) as u32) << 10) | (STATE << 5) | 1); // str x1, [x19, #slot]
+            self.store(1, destination.slot);
         }
     }
 
@@ -223,35 +318,64 @@ impl Assembler {
             kind,
             lhs,
             rhs,
-            destination,
+            dst,
             helper,
             op,
             write_tag,
         } = binary;
         let mut checks = Vec::new();
+        // A memory destination lands its result in x0 before the store; a
+        // pinned destination is computed into its own register.
+        let result = dst.pin.unwrap_or(0);
         // add/sub of a base operand and an immediate that fits the imm12 field
         // fold into a single instruction, sparing the scratch-register load.
         if let Some((base, value)) = super::immediate_form(kind, lhs, rhs)
             && value <= 0xFFF
         {
-            self.load_operand(base, 0, &mut checks);
-            let opcode = match kind {
-                FastBinaryOp::Add => 0x9100_0000,      // add x0, x0, #imm
-                FastBinaryOp::Subtract => 0xD100_0000, // sub x0, x0, #imm
+            let base = self.operand_register(base, 0, &mut checks);
+            match kind {
+                FastBinaryOp::Add => self.add_immediate(result, base, value as u32),
+                FastBinaryOp::Subtract => self.subtract_immediate(result, base, value as u32),
                 FastBinaryOp::Multiply => unreachable!(),
-            };
-            self.word(opcode | ((value as u32) << 10));
+            }
         } else {
-            self.load_operand(lhs, 0, &mut checks);
-            self.load_operand(rhs, 1, &mut checks);
-            self.word(match kind {
-                FastBinaryOp::Add => 0x8B01_0000,      // add x0, x0, x1
-                FastBinaryOp::Subtract => 0xCB01_0000, // sub x0, x0, x1
-                FastBinaryOp::Multiply => 0x9B01_7C00, // mul x0, x0, x1
-            });
+            let left = self.operand_register(lhs, 0, &mut checks);
+            let right = self.operand_register(rhs, 1, &mut checks);
+            match kind {
+                FastBinaryOp::Add => self.add_registers(result, left, right),
+                FastBinaryOp::Subtract => self.subtract_registers(result, left, right),
+                FastBinaryOp::Multiply => self.multiply_registers(result, left, right),
+            }
         }
-        self.store_result(destination, write_tag);
-        self.slow_path(checks, |assembler| assembler.call(helper, &[op]));
+        self.store_through(&dst, result, write_tag);
+        self.slow_path(checks, |assembler| {
+            assembler.call(helper, &[op]);
+            assembler.reload_pinned();
+        });
+    }
+
+    /// Copies a proven `Uint64` payload from `source` to `destination`,
+    /// keeping it in the destination's pinned register when it has one and
+    /// writing it through to the slot either way.
+    pub(super) fn copy_register(
+        &mut self,
+        source: FastOperand,
+        destination: FastDest,
+        write_tag: bool,
+    ) {
+        let mut checks = Vec::new();
+        let source = self.operand_register(source, 0, &mut checks);
+        debug_assert!(checks.is_empty(), "a proven source never needs a tag check");
+        let value = match destination.pin {
+            Some(register) => {
+                if register != source {
+                    self.move_register(register, source);
+                }
+                register
+            }
+            None => source,
+        };
+        self.store_through(&destination, value, write_tag);
     }
 
     pub(super) fn copy_slot(&mut self, source: usize, destination: usize) {
@@ -273,8 +397,12 @@ impl Assembler {
         op: u64,
     ) {
         let mut checks = Vec::new();
-        self.load_operand(source, 0, &mut checks);
-        self.branch_fixup(0xB400_0000, FixupKind::Imm19, FixupTarget::Op(target)); // cbz x0
+        let register = self.operand_register(source, 0, &mut checks);
+        self.branch_fixup(
+            0xB400_0000 | register,
+            FixupKind::Imm19,
+            FixupTarget::Op(target),
+        ); // cbz register
         self.slow_path(checks, |assembler| {
             assembler.call(helper, &[op]);
             assembler.branch_taken(target);
@@ -290,9 +418,9 @@ impl Assembler {
         op: u64,
     ) {
         let mut checks = Vec::new();
-        self.load_operand(lhs, 0, &mut checks);
-        self.load_operand(rhs, 1, &mut checks);
-        self.word(0xEB01_001F); // cmp x0, x1
+        let left = self.operand_register(lhs, 0, &mut checks);
+        let right = self.operand_register(rhs, 1, &mut checks);
+        self.compare_registers(left, right);
         self.branch_fixup(0x5400_0000, FixupKind::Imm19, FixupTarget::Op(target)); // b.eq
         self.slow_path(checks, |assembler| {
             assembler.call(helper, &[op]);

@@ -63,6 +63,49 @@ fn fast_paths_fall_back_for_other_types() {
     assert_eq!(top(&PROGRAM), expected);
 }
 
+// The optimizer proves r3 is a Uint64 and the allocator pins it, yet the add
+// that writes it reads r2, whose runtime Uint32 fails the tag check and drives
+// the slow-path helper. The pinned r3 must be reloaded from the bank the
+// helper wrote, so the jit's result and bank match the interpreter.
+#[test]
+fn slow_path_reloads_pinned_destination() {
+    use crate::machine::optimizer::{OptimizedProgram, ValueType};
+
+    static PROGRAM: RawProgram = program!(
+        op!(Pop, Register2),
+        op!(Pop, Register1),
+        op!(Push, Register1),
+        op!(Push, Register2),
+        op!(Add),
+        op!(Pop, Register3),
+        op!(Push, Register3),
+        op!(Exit),
+    );
+
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
+    let optimized =
+        OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64, ValueType::Uint32]);
+    let jit = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
+    let interpreted = MachineProgram::Intermediate(intermediate);
+
+    for (base, addend) in [(0u64, 0u32), (5, 7), (u64::MAX, 1), (1000, u32::MAX)] {
+        let mut jitted = Machine::new(ops::all());
+        jitted.state().push(MachineValue::Uint64(base));
+        jitted.state().push(MachineValue::Uint32(addend));
+        jitted.run(&jit).unwrap();
+
+        let mut interpreter = Machine::new(ops::all());
+        interpreter.state().push(MachineValue::Uint64(base));
+        interpreter.state().push(MachineValue::Uint32(addend));
+        interpreter.run(&interpreted).unwrap();
+
+        let jit_result = jitted.state().pop().unwrap();
+        let interpreter_result = interpreter.state().pop().unwrap();
+        assert_eq!(jit_result, interpreter_result, "result mismatch for {base} + {addend}");
+        assert_eq!(jitted.state().bank(), interpreter.state().bank());
+    }
+}
+
 // A jump-if-zero on a constant compiles to static control flow: a bare jump
 // when the constant is zero, a fall-through when it is not.
 #[test]
