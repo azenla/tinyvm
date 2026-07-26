@@ -83,8 +83,10 @@ fn slow_path_reloads_pinned_destination() {
     );
 
     let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
-    let optimized =
-        OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64, ValueType::Uint32]);
+    let optimized = OptimizedProgram::compile_with_inputs(
+        &intermediate,
+        &[ValueType::Uint64, ValueType::Uint32],
+    );
     let jit = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
     let interpreted = MachineProgram::Intermediate(intermediate);
 
@@ -101,7 +103,10 @@ fn slow_path_reloads_pinned_destination() {
 
         let jit_result = jitted.state().pop().unwrap();
         let interpreter_result = interpreter.state().pop().unwrap();
-        assert_eq!(jit_result, interpreter_result, "result mismatch for {base} + {addend}");
+        assert_eq!(
+            jit_result, interpreter_result,
+            "result mismatch for {base} + {addend}"
+        );
         assert_eq!(jitted.state().bank(), interpreter.state().bank());
     }
 }

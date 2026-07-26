@@ -103,7 +103,11 @@ fn register_operand(index: usize, types: &RegisterTypes, pins: &[Option<u32>]) -
     }
 }
 
-fn fast_operand(source: &Source, types: &RegisterTypes, pins: &[Option<u32>]) -> Option<FastOperand> {
+fn fast_operand(
+    source: &Source,
+    types: &RegisterTypes,
+    pins: &[Option<u32>],
+) -> Option<FastOperand> {
     match source {
         Source::Register(index) => Some(register_operand(*index, types, pins)),
         Source::Value(MachineValue::Uint64(value)) => Some(FastOperand::Immediate(*value)),
@@ -417,7 +421,11 @@ fn emit(
                 // division, not a hardware trap.
                 BinaryOpKind::Divide | BinaryOpKind::Remainder => None,
             };
-            match (fast, fast_operand(lhs, types, pins), fast_operand(rhs, types, pins)) {
+            match (
+                fast,
+                fast_operand(lhs, types, pins),
+                fast_operand(rhs, types, pins),
+            ) {
                 (Some(kind), Some(lhs), Some(rhs)) => {
                     // The fast path always yields a `Uint64`, so when the
                     // destination already holds one its tag byte is correct
@@ -462,7 +470,8 @@ fn emit(
                     }
                 }
                 Source::Value(value) => {
-                    assembler.copy_constant(value as *const MachineValue as usize, destination.slot);
+                    assembler
+                        .copy_constant(value as *const MachineValue as usize, destination.slot);
                     if let Some(register) = destination.pin {
                         assembler.reload_one(register, destination.slot);
                     }
@@ -474,9 +483,10 @@ fn emit(
                 if rhs == lhs {
                     assembler.jump(*target);
                 }
-            } else if let (Some(lhs), Some(rhs)) =
-                (fast_operand(lhs, types, pins), fast_operand(rhs, types, pins))
-            {
+            } else if let (Some(lhs), Some(rhs)) = (
+                fast_operand(lhs, types, pins),
+                fast_operand(rhs, types, pins),
+            ) {
                 assembler.jump_if_equal_fast(
                     lhs,
                     rhs,

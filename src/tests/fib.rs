@@ -121,7 +121,10 @@ fn jit_optimized_matches_interpreter() {
 
         let jit_result = jitted.state().pop().unwrap();
         let interpreter_result = interpreter.state().pop().unwrap();
-        assert_eq!(jit_result, interpreter_result, "result mismatch for input {input}");
+        assert_eq!(
+            jit_result, interpreter_result,
+            "result mismatch for input {input}"
+        );
         assert_eq!(
             jitted.state().bank(),
             interpreter.state().bank(),

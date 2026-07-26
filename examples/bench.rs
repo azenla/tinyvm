@@ -1,57 +1,71 @@
-use std::hint::black_box;
+use std::collections::VecDeque;
 use std::str::FromStr;
 use std::time::Instant;
 use tinyvm::machine::intermediate::IntermediateProgram;
 use tinyvm::machine::optimizer::{OptimizedProgram, ValueType};
 use tinyvm::machine::value::MachineValue;
-use tinyvm::machine::{Machine, MachineProgram, ops};
+use tinyvm::machine::{Machine, MachineLoopState, MachineProgram, ops};
+use tinyvm::op::OpArg;
 use tinyvm::program::RawProgram;
 
-const INPUT: u64 = 2_000_000;
-const RUNS: u32 = 20;
-const OPS_PER_RUN: u64 = 9 + INPUT * 15;
+const DEFAULT_PROGRAM: &str = "programs/fib.tinyvm";
+const DEFAULT_RUNS: u64 = 20;
+const DEFAULT_INPUTS: &[&str] = &["2000000u64"];
 
-/// The fib program written straight in Rust: what the machine's compiled modes
-/// are converging toward. Arithmetic wraps to match the machine's `wrapping_*`
-/// semantics (see `value/numerics.rs`), so the result is bit-identical. This is
-/// the ceiling — the vops/s a mode would hit if it lowered to code this tight.
-fn fib_native(mut counter: u64) -> u64 {
-    let mut previous = 0u64;
-    let mut current = 1u64;
-    while counter != 0 {
-        let next = previous.wrapping_add(current);
-        previous = current;
-        current = next;
-        counter = counter.wrapping_sub(1);
-    }
-    previous
-}
-
-// Modes that fuse or fold ops execute fewer dispatches than the raw program,
-// so their rate is reported in virtual ops — raw ops retired per second —
-// labeled "vops" instead of "ops".
-fn bench(label: &str, unit: &str, mut run: impl FnMut()) {
+fn bench(runs: u64, ops_per_run: u64, label: &str, unit: &str, mut run: impl FnMut()) {
     run();
     let start = Instant::now();
-    for _ in 0..RUNS {
+    for _ in 0..runs {
         run();
     }
     let elapsed = start.elapsed();
-    let ops = (OPS_PER_RUN * RUNS as u64) as f64;
+    let ops = (ops_per_run * runs) as f64;
     let secs = elapsed.as_secs_f64();
     println!(
         "{label:<12} {:>7.1} M {unit:>4}/s  {:>8.1} runs/s  ({elapsed:?})",
         ops / secs / 1e6,
-        RUNS as f64 / secs
+        runs as f64 / secs
     );
 }
 
 fn main() {
-    let text = std::fs::read_to_string("programs/fib.tinyvm").unwrap();
+    let mut args = std::env::args().skip(1).collect::<VecDeque<_>>();
+    let program_path = args.pop_front().unwrap_or(DEFAULT_PROGRAM.into());
+    let runs = args
+        .pop_front()
+        .unwrap_or(DEFAULT_RUNS.to_string())
+        .parse::<u64>()
+        .unwrap();
+
+    if args.is_empty() {
+        args = DEFAULT_INPUTS.iter().map(|&s| s.into()).collect();
+    }
+
+    let inputs = args
+        .iter()
+        .map(|item| OpArg::from_str(item).unwrap())
+        .collect::<Vec<_>>();
+    let types = inputs
+        .iter()
+        .map(|input| match input {
+            OpArg::None => ValueType::None,
+            OpArg::Uint8(_) => ValueType::Uint8,
+            OpArg::Uint16(_) => ValueType::Uint16,
+            OpArg::Uint32(_) => ValueType::Uint32,
+            OpArg::Uint64(_) => ValueType::Uint64,
+            OpArg::Int8(_) => ValueType::Int8,
+            OpArg::Int16(_) => ValueType::Int16,
+            OpArg::Int32(_) => ValueType::Int32,
+            OpArg::Int64(_) => ValueType::Int64,
+            OpArg::Instruction(_) => ValueType::ReturnAddress,
+            _ => panic!("bad input type"),
+        })
+        .collect::<Vec<_>>();
+    let text = std::fs::read_to_string(program_path).unwrap();
     let program = RawProgram::from_str(&text).unwrap();
 
     let intermediate = IntermediateProgram::compile(&program).unwrap();
-    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &types);
 
     let mut modes = vec![
         ("uncompiled", "ops", MachineProgram::Uncompiled(&program)),
@@ -86,18 +100,35 @@ fn main() {
         ));
     }
 
-    for (label, unit, prog) in &modes {
+    let values = inputs
+        .iter()
+        .map(|input| MachineValue::from(*input))
+        .collect::<Vec<_>>();
+
+    let mut ops_per_run = 0u64;
+    {
         let mut machine = Machine::new(ops::all());
-        bench(label, unit, || {
-            machine.state().reset();
-            machine.state().push(MachineValue::Uint64(INPUT));
-            machine.run(prog).unwrap();
-        });
+        let uncompiled = MachineProgram::Uncompiled(&program);
+        for item in &values {
+            machine.state().push(*item);
+        }
+        loop {
+            let result = machine.step(&uncompiled).unwrap();
+            ops_per_run += 1;
+            if result == MachineLoopState::Break {
+                break;
+            }
+        }
     }
 
-    // `black_box` on both ends keeps the compiler from hoisting the constant
-    // result out of the timing loop, so this measures the loop, not folding.
-    bench("native", "vops", || {
-        black_box(fib_native(black_box(INPUT)));
-    });
+    for (label, unit, program) in &modes {
+        let mut machine = Machine::new(ops::all());
+        bench(runs, ops_per_run, label, unit, || {
+            machine.state().reset();
+            for item in &values {
+                machine.state().push(*item);
+            }
+            machine.run(program).unwrap();
+        });
+    }
 }
