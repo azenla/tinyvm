@@ -102,6 +102,11 @@ impl MachineState {
         &self.bank
     }
 
+    /// The op the machine will execute next.
+    pub fn current(&self) -> usize {
+        self.current
+    }
+
     /// Optimized programs may declare the types the caller pushes before
     /// running; type-specialized code trusts the declaration, so entering at
     /// instruction zero verifies it against the actual stack. Resuming at

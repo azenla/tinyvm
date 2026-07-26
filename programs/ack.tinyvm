@@ -4,58 +4,69 @@
 #   A(m, n) = A(m - 1, 1)              if m > 0 and n == 0
 #   A(m, n) = A(m - 1, A(m, n - 1))    if m > 0 and n > 0
 #
-# Inputs are read from the stack as (m, n) with n on top; the single result
-# is left on the stack. Registers r1-r9 are global and are clobbered by
-# recursive calls, so every value that must outlive a `call` is kept on the
-# value stack (the call stack only holds return addresses).
+# Inputs are read from the stack as (m, n) with n on top, and the single
+# result is left on the stack.
+#
+# Calling convention: `ack` takes m in r1 and n in r2, and leaves its result
+# in r9. Registers are global, so a recursive call clobbers all three; the
+# only value that must outlive one is m, which is spilled to the value stack
+# for exactly the duration of the inner call. Keeping arguments and results
+# in registers lets the optimizer fuse the arithmetic into register-to-
+# register superinstructions, which the jit inlines instead of calling out to
+# a stack helper per op.
+#
+# Both recursive tails are jumps rather than calls, so only the inner
+# A(m, n - 1) consumes call-stack depth.
 
 # --- main (instruction 0) ---
-# The two inputs already sit on the stack as (m, n) with n on top, which is
-# exactly the calling convention `ack` expects. Invoke it, then exit with the
-# result on the stack.
-call 2p
-exit
-
-# --- ack (instruction 2) ---
-# Pop the arguments: n is on top, m beneath it.
+# Unpack the inputs into the argument registers: n is on top, m beneath it.
 pop r2
 pop r1
-# Base case: if m == 0, the result is n + 1. (jump to instruction 21)
-push r1
-jiz 21p
-# m > 0. If n == 0, the result is A(m - 1, 1). (jump to instruction 25)
-push r2
-jiz 25p
-# m > 0 and n > 0: the result is A(m - 1, A(m, n - 1)).
-# Save m on the stack so it survives the inner recursive call.
-push r1
-# Push the inner call's arguments and compute n - 1: A(m, n - 1).
-push r1
-push r2
-push 1u64
-sub
-# Recurse. Afterwards the stack holds [saved_m, inner_result].
-call 2p
-# Reload the two values the recursion clobbered.
-pop r3
-pop r4
-# Push the outer call's arguments and compute m - 1: A(m - 1, inner_result).
-push r4
-push 1u64
-sub
-push r3
-# Tail call: A(m - 1, inner_result) becomes our result.
-jmp 2p
+call 5p
+# Push the result and exit.
+push r9
+exit
 
-# --- m == 0 (instruction 21): result is n + 1 ---
+# --- ack (instruction 5) ---
+# Base case: if m == 0, the result is n + 1. (jump to instruction 23)
+push r1
+jiz 23p
+# m > 0. If n == 0, the result is A(m - 1, 1). (jump to instruction 28)
+push r2
+jiz 28p
+
+# m > 0 and n > 0: the result is A(m - 1, A(m, n - 1)).
+# Spill m; the inner call clobbers r1.
+push r1
+# Inner call takes (m, n - 1). r1 already holds m, so only n changes.
+push r2
+push 1u64
+sub
+pop r2
+call 5p
+# Reclaim m, then build the outer call's arguments: (m - 1, inner result).
+pop r1
+push r9
+pop r2
+push r1
+push 1u64
+sub
+pop r1
+# Tail call: A(m - 1, inner result) is our result.
+jmp 5p
+
+# --- m == 0 (instruction 23): result is n + 1 ---
 push r2
 push 1u64
 add
+pop r9
 ret
 
-# --- n == 0 (instruction 25): result is A(m - 1, 1) ---
+# --- n == 0 (instruction 28): result is A(m - 1, 1) ---
 push r1
 push 1u64
 sub
+pop r1
 push 1u64
-jmp 2p
+pop r2
+jmp 5p
