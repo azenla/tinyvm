@@ -1,4 +1,4 @@
-use super::{FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET};
+use super::{FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, Spill};
 use crate::machine::error::{MachineError, Result};
 
 // Register conventions for generated code: rbx holds the machine state pointer,
@@ -191,8 +191,12 @@ impl Assembler {
         self.bytes(&[0xFF, 0xE6]); // jmp rsi
     }
 
+    /// The single exit from generated code. Pinned registers hold payloads their
+    /// bank slots do not, so they are written back here, once, rather than at
+    /// every call along the way.
     pub(super) fn epilogue(&mut self) {
         self.epilogue_offset = self.code.len();
+        self.spill_pinned();
         let pinned = self.pinned.clone();
         let frame = self.frame();
         self.bytes(&[0x48, 0x83, 0xC4, frame]); // add rsp, frame
@@ -204,12 +208,20 @@ impl Assembler {
         self.bytes(&[0xC3]); // ret
     }
 
-    /// Writes every pinned register's payload back to its bank slot, making the
-    /// bank coherent for the helper a call is about to enter.
+    /// Writes every pinned register's payload back to its bank slot.
     fn spill_pinned(&mut self) {
         let pinned = self.pinned.clone();
         for (register, slot) in &pinned {
             self.store(*register as u8, slot + PAYLOAD_OFFSET);
+        }
+    }
+
+    /// Brings the bank slots a helper is about to read up to date.
+    fn apply_spill(&mut self, spill: Spill) {
+        match spill {
+            Spill::None => {}
+            Spill::One { register, slot } => self.store(register as u8, slot + PAYLOAD_OFFSET),
+            Spill::All => self.spill_pinned(),
         }
     }
 
@@ -227,16 +239,15 @@ impl Assembler {
         self.load(register as u8, slot + PAYLOAD_OFFSET);
     }
 
-    pub(super) fn call(&mut self, function: *const (), args: &[u64]) {
+    pub(super) fn call(&mut self, function: *const (), args: &[u64], spill: Spill) {
         #[cfg(windows)]
         const ARGUMENTS: [(u8, u8); 2] = [(0x48, 2), (0x49, 0)]; // rdx, r8
         #[cfg(not(windows))]
         const ARGUMENTS: [(u8, u8); 2] = [(0x48, 6), (0x48, 2)]; // rsi, rdx
 
-        // The helper reads and writes the bank directly, so flush the pinned
-        // registers' payloads to it first; callers reload afterward if the
-        // helper may have written the bank.
-        self.spill_pinned();
+        // Flush whatever the helper reads from the bank; callers reload
+        // afterward if it may have written the bank.
+        self.apply_spill(spill);
         #[cfg(windows)]
         self.bytes(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
         #[cfg(not(windows))]
@@ -395,7 +406,7 @@ impl Assembler {
         }
         self.store_through(&dst, write_tag);
         self.slow_path(checks, |assembler| {
-            assembler.call(helper, &[op]);
+            assembler.call(helper, &[op], Spill::All);
             assembler.reload_pinned();
         });
     }
@@ -449,7 +460,7 @@ impl Assembler {
         self.test_status();
         self.branch_fixup(&[0x0F, 0x84], FixupTarget::Op(target)); // jz
         self.slow_path(checks, |assembler| {
-            assembler.call(helper, &[op]);
+            assembler.call(helper, &[op], Spill::All);
             assembler.branch_taken(target);
         });
     }
@@ -468,7 +479,7 @@ impl Assembler {
         self.bytes(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
         self.branch_fixup(&[0x0F, 0x84], FixupTarget::Op(target)); // je
         self.slow_path(checks, |assembler| {
-            assembler.call(helper, &[op]);
+            assembler.call(helper, &[op], Spill::All);
             assembler.branch_taken(target);
         });
     }

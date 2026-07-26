@@ -158,6 +158,46 @@ fn divide_reloads_pinned_destination() {
     }
 }
 
+// A helper that reads no register slot gets no spill before it runs, so the
+// only thing that writes a pinned payload back to the bank is the epilogue.
+// This program leaves r1 live in its pinned register and then fails a pop on an
+// empty stack, exiting through the error path; the bank the caller observes
+// afterward must still match the interpreter's.
+#[test]
+fn bank_is_coherent_after_an_error_exit() {
+    use crate::machine::optimizer::{OptimizedProgram, ValueType};
+
+    static PROGRAM: RawProgram = program!(
+        op!(Pop, Register1),
+        // r1 = r1 + 1, landing only in the pinned register.
+        op!(Push, Register1),
+        op!(Push, Uint64(1)),
+        op!(Add),
+        op!(Pop, Register1),
+        // The stack is empty by now, so this fails.
+        op!(Pop, Register2),
+        op!(Exit),
+    );
+
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
+    let jit = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
+    let interpreted = MachineProgram::Intermediate(intermediate);
+
+    let mut jitted = Machine::new(ops::all());
+    jitted.state().push(MachineValue::Uint64(41));
+    let jit_error = jitted.run(&jit).unwrap_err();
+
+    let mut interpreter = Machine::new(ops::all());
+    interpreter.state().push(MachineValue::Uint64(41));
+    let interpreter_error = interpreter.run(&interpreted).unwrap_err();
+
+    assert_eq!(jit_error, MachineError::StackEmpty);
+    assert_eq!(jit_error, interpreter_error);
+    assert_eq!(interpreter.state().bank().get(0), MachineValue::Uint64(42));
+    assert_eq!(jitted.state().bank(), interpreter.state().bank());
+}
+
 // An odd number of pinned registers pads the saved-register area for
 // alignment (x86_64) and pairs a register with the zero register (aarch64).
 // Popping then pushing three Uint64 registers pins three of them and routes

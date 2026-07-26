@@ -1,4 +1,4 @@
-use super::{FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET};
+use super::{FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, Spill};
 use crate::machine::error::{MachineError, Result};
 
 // Register conventions for generated code: x19 holds the machine state
@@ -168,8 +168,12 @@ impl Assembler {
         self.word(0xD61F_0020); // br x1
     }
 
+    /// The single exit from generated code. Pinned registers hold payloads their
+    /// bank slots do not, so they are written back here, once, rather than at
+    /// every call along the way.
     pub(super) fn epilogue(&mut self) {
         self.epilogue_offset = self.code.len();
+        self.spill_pinned();
         let pinned = self.pinned.clone();
         let mut pairs = pin_pairs(&pinned);
         pairs.reverse();
@@ -195,11 +199,10 @@ impl Assembler {
         self.load(register, slot + PAYLOAD_OFFSET);
     }
 
-    pub(super) fn call(&mut self, function: *const (), args: &[u64]) {
-        // The helper reads and writes the bank directly, so flush the pinned
-        // registers' payloads to it first; callers reload afterward if the
-        // helper may have written the bank.
-        self.spill_pinned();
+    pub(super) fn call(&mut self, function: *const (), args: &[u64], spill: Spill) {
+        // Flush whatever the helper reads from the bank; callers reload
+        // afterward if it may have written the bank.
+        self.apply_spill(spill);
         self.move_register(ARGUMENTS[0], STATE);
         for (index, argument) in args.iter().enumerate() {
             self.load_immediate(ARGUMENTS[index + 1], *argument);
@@ -309,12 +312,20 @@ impl Assembler {
         }
     }
 
-    /// Writes every pinned register's payload back to its bank slot, making the
-    /// bank coherent for the helper a call is about to enter.
+    /// Writes every pinned register's payload back to its bank slot.
     fn spill_pinned(&mut self) {
         let pinned = self.pinned.clone();
         for (register, slot) in &pinned {
             self.store(*register, slot + PAYLOAD_OFFSET);
+        }
+    }
+
+    /// Brings the bank slots a helper is about to read up to date.
+    fn apply_spill(&mut self, spill: Spill) {
+        match spill {
+            Spill::None => {}
+            Spill::One { register, slot } => self.store(register, slot + PAYLOAD_OFFSET),
+            Spill::All => self.spill_pinned(),
         }
     }
 
@@ -366,7 +377,7 @@ impl Assembler {
         }
         self.store_through(&dst, result, write_tag);
         self.slow_path(checks, |assembler| {
-            assembler.call(helper, &[op]);
+            assembler.call(helper, &[op], Spill::All);
             assembler.reload_pinned();
         });
     }
@@ -421,7 +432,7 @@ impl Assembler {
             FixupTarget::Op(target),
         ); // cbz register
         self.slow_path(checks, |assembler| {
-            assembler.call(helper, &[op]);
+            assembler.call(helper, &[op], Spill::All);
             assembler.branch_taken(target);
         });
     }
@@ -440,7 +451,7 @@ impl Assembler {
         self.compare_registers(left, right);
         self.branch_fixup(0x5400_0000, FixupKind::Imm19, FixupTarget::Op(target)); // b.eq
         self.slow_path(checks, |assembler| {
-            assembler.call(helper, &[op]);
+            assembler.call(helper, &[op], Spill::All);
             assembler.branch_taken(target);
         });
     }

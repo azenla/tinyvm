@@ -80,6 +80,21 @@ pub(super) struct FastBinary {
     pub write_tag: bool,
 }
 
+/// Which pinned registers a helper needs written back to the bank before it
+/// runs. A pinned register's payload lives in its cpu register between calls and
+/// its slot goes stale, so anything the helper reads has to be brought up to
+/// date first. Helpers that read no slot need nothing: coherence on the way out
+/// of generated code is the epilogue's job, not every call's.
+#[derive(Clone, Copy)]
+pub(super) enum Spill {
+    /// Reads no register slot.
+    None,
+    /// Reads the one slot belonging to this pinned register.
+    One { register: u32, slot: usize },
+    /// May read any slot.
+    All,
+}
+
 /// Byte offset of a register's value slot from the machine state pointer.
 fn slot(index: usize) -> usize {
     std::mem::offset_of!(MachineState, bank) + RegisterBank::slot_offset(index)
@@ -87,6 +102,18 @@ fn slot(index: usize) -> usize {
 
 fn pin_of(index: usize, pins: &[Option<u32>]) -> Option<u32> {
     pins.get(index).copied().flatten()
+}
+
+/// The spill a helper needs to read register `index` from the bank. An unpinned
+/// register needs none: its slot is its only home, so it is never stale.
+fn spill_of(index: usize, pins: &[Option<u32>]) -> Spill {
+    match pin_of(index, pins) {
+        Some(register) => Spill::One {
+            register,
+            slot: slot(index),
+        },
+        None => Spill::None,
+    }
 }
 
 /// The operand form of a register slot: trusted (and pinned when the allocator
@@ -159,7 +186,7 @@ fn allocate(
     // when proven `Uint64` but straight from memory otherwise, and a pinned
     // register's memory payload goes stale between spills. So a register read
     // inline while not `Uint64` cannot be pinned; helper reads are always
-    // coherent (the bank is spilled before every call) and do not disqualify.
+    // coherent (a call spills the slots its helper reads) and do not disqualify.
     macro_rules! read_inline {
         ($pc:expr, $index:expr) => {{
             let index = $index;
@@ -310,7 +337,11 @@ impl JitProgram {
         }
 
         let overflow = assembler.offset();
-        assembler.call(helper::overflow as *const (), &[ops.len() as u64]);
+        assembler.call(
+            helper::overflow as *const (),
+            &[ops.len() as u64],
+            Spill::None,
+        );
         assembler.epilogue();
         assembler.patch(&offsets, overflow)?;
 
@@ -357,54 +388,96 @@ fn emit(
     let position = pc as u64;
     match op {
         IntermediateOp::PushValue(_) => {
-            assembler.call(helper::push_value as *const (), &[data]);
+            assembler.call(helper::push_value as *const (), &[data], Spill::None);
         }
-        IntermediateOp::PushRegister(_) => {
-            assembler.call(helper::push_register as *const (), &[data]);
+        IntermediateOp::PushRegister(index) => {
+            // Reads one bank slot, so only that register needs flushing.
+            assembler.call(
+                helper::push_register as *const (),
+                &[data],
+                spill_of(*index, pins),
+            );
         }
-        IntermediateOp::PopRegister(_) => {
-            assembler.call(helper::pop_register as *const (), &[data, position]);
+        IntermediateOp::PopRegister(index) => {
+            // Writes one bank slot and reads none, so nothing needs flushing
+            // first.
+            assembler.call(
+                helper::pop_register as *const (),
+                &[data, position],
+                Spill::None,
+            );
             assembler.check_error();
-            // The helper wrote the bank directly, so refresh any pinned
-            // register it may have overwritten from memory.
-            assembler.reload_pinned();
+            // Refresh only the register the helper wrote. Reloading the rest
+            // would overwrite live payloads with the stale slots behind them,
+            // and doing it after the error check keeps a failed pop from
+            // pulling a stale payload into a pinned register.
+            if let Some(register) = pin_of(*index, pins) {
+                assembler.reload_one(register, slot(*index));
+            }
         }
         IntermediateOp::Add
         | IntermediateOp::Subtract
         | IntermediateOp::Multiply
         | IntermediateOp::Divide
         | IntermediateOp::Remainder => {
-            assembler.call(helper::binary_stack as *const (), &[data, position]);
+            assembler.call(
+                helper::binary_stack as *const (),
+                &[data, position],
+                Spill::None,
+            );
             assembler.check_error();
         }
         IntermediateOp::CountLeadingZeros
         | IntermediateOp::CountLeadingOnes
         | IntermediateOp::CountTrailingZeros
         | IntermediateOp::CountTrailingOnes => {
-            assembler.call(helper::count_stack as *const (), &[data, position]);
+            assembler.call(
+                helper::count_stack as *const (),
+                &[data, position],
+                Spill::None,
+            );
             assembler.check_error();
         }
         IntermediateOp::JumpIfEqual(target) => {
-            assembler.call(helper::jump_if_equal_stack as *const (), &[position]);
+            assembler.call(
+                helper::jump_if_equal_stack as *const (),
+                &[position],
+                Spill::None,
+            );
             assembler.branch_status(*target);
         }
         IntermediateOp::JumpIfZero(target) => {
-            assembler.call(helper::jump_if_zero_stack as *const (), &[position]);
+            assembler.call(
+                helper::jump_if_zero_stack as *const (),
+                &[position],
+                Spill::None,
+            );
             assembler.branch_status(*target);
         }
         IntermediateOp::Jump(target) => {
             assembler.jump(*target);
         }
         IntermediateOp::Call(target) => {
-            assembler.call(helper::push_call as *const (), &[(pc + 1) as u64]);
+            // Touches only the call stack.
+            assembler.call(
+                helper::push_call as *const (),
+                &[(pc + 1) as u64],
+                Spill::None,
+            );
             assembler.jump(*target);
         }
         IntermediateOp::Return => {
-            assembler.call(helper::pop_return as *const (), &[length as u64, position]);
+            assembler.call(
+                helper::pop_return as *const (),
+                &[length as u64, position],
+                Spill::None,
+            );
             assembler.return_dispatch();
         }
         IntermediateOp::Exit => {
-            assembler.call(helper::finish as *const (), &[position]);
+            // Only records the program counter; the epilogue makes the bank
+            // coherent on the way out.
+            assembler.call(helper::finish as *const (), &[position], Spill::None);
             assembler.jump_epilogue();
         }
         IntermediateOp::Binary {
@@ -446,7 +519,9 @@ fn emit(
                 // helper writes the destination's slot directly, so a pinned
                 // destination is refreshed from it.
                 _ => {
-                    assembler.call(helper::binary_values as *const (), &[data]);
+                    // Resolves both operands from the bank, so every pinned
+                    // register has to be in memory first.
+                    assembler.call(helper::binary_values as *const (), &[data], Spill::All);
                     if let Some(register) = pin_of(*dst, pins) {
                         assembler.reload_one(register, slot(*dst));
                     }
@@ -504,7 +579,12 @@ fn emit(
                     data,
                 );
             } else {
-                assembler.call(helper::jump_if_equal_values as *const (), &[data]);
+                // Resolves both operands from the bank.
+                assembler.call(
+                    helper::jump_if_equal_values as *const (),
+                    &[data],
+                    Spill::All,
+                );
                 assembler.branch_taken(*target);
             }
         }
