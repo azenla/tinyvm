@@ -10,7 +10,7 @@ use crate::machine::value::MachineValue;
 use crate::machine::{Machine, MachineProgram, ops};
 use crate::op;
 use crate::op::OpArg::{Instruction, Register1, Register2, Register3, Uint32, Uint64};
-use crate::op::OpCode::{Add, Exit, JumpIfZero, Pop, Push};
+use crate::op::OpCode::{Add, Divide, Exit, JumpIfZero, Pop, Push};
 use crate::program;
 use crate::program::RawProgram;
 
@@ -106,6 +106,53 @@ fn slow_path_reloads_pinned_destination() {
         assert_eq!(
             jit_result, interpreter_result,
             "result mismatch for {base} + {addend}"
+        );
+        assert_eq!(jitted.state().bank(), interpreter.state().bank());
+    }
+}
+
+// Divide and remainder have no inlined fast path at all, so a `Binary` writing
+// a pinned register always goes through `binary_values`, which writes the bank
+// slot directly and leaves the pinned cpu register holding the old payload. The
+// following add reads r1 inline, from that register, so it must be refreshed.
+#[test]
+fn divide_reloads_pinned_destination() {
+    use crate::machine::optimizer::{OptimizedProgram, ValueType};
+
+    static PROGRAM: RawProgram = program!(
+        op!(Pop, Register1),
+        // r1 = r1 / 2, through the helper.
+        op!(Push, Register1),
+        op!(Push, Uint64(2)),
+        op!(Divide),
+        op!(Pop, Register1),
+        // r2 = r1 + 0, reading r1 inline from its pinned register.
+        op!(Push, Register1),
+        op!(Push, Uint64(0)),
+        op!(Add),
+        op!(Pop, Register2),
+        op!(Push, Register2),
+        op!(Exit),
+    );
+
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
+    let jit = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
+    let interpreted = MachineProgram::Intermediate(intermediate);
+
+    for value in [100u64, 0, 7, u64::MAX] {
+        let mut jitted = Machine::new(ops::all());
+        jitted.state().push(MachineValue::Uint64(value));
+        jitted.run(&jit).unwrap();
+
+        let mut interpreter = Machine::new(ops::all());
+        interpreter.state().push(MachineValue::Uint64(value));
+        interpreter.run(&interpreted).unwrap();
+
+        assert_eq!(
+            jitted.state().pop().unwrap(),
+            interpreter.state().pop().unwrap(),
+            "result mismatch for {value} / 2"
         );
         assert_eq!(jitted.state().bank(), interpreter.state().bank());
     }

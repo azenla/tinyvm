@@ -441,7 +441,16 @@ fn emit(
                         write_tag,
                     });
                 }
-                _ => assembler.call(helper::binary_values as *const (), &[data]),
+                // Divide and remainder have no fast path, and an operand that is
+                // not a `Uint64` immediate cannot be materialized inline. The
+                // helper writes the destination's slot directly, so a pinned
+                // destination is refreshed from it.
+                _ => {
+                    assembler.call(helper::binary_values as *const (), &[data]);
+                    if let Some(register) = pin_of(*dst, pins) {
+                        assembler.reload_one(register, slot(*dst));
+                    }
+                }
             }
         }
         IntermediateOp::Copy { src, dst } => {
