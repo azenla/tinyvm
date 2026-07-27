@@ -55,6 +55,18 @@ fn lowering(op: &IntermediateOp, types: &RegisterTypes) -> Lowering {
         // Control flow the backend resolves to a fixed address.
         IntermediateOp::Jump(_) => Lowering::Inline,
 
+        // Stack traffic, inlined against the stack's own layout: a bounds
+        // compare, a sixteen-byte copy, and a length write-back. The helper
+        // takes over only to grow a full stack or report an empty one.
+        IntermediateOp::PushValue(_)
+        | IntermediateOp::PushRegister(_)
+        | IntermediateOp::PopRegister(_)
+        | IntermediateOp::Call(_) => Lowering::Fast,
+
+        // Also inlined, plus a tag check and a range check before dispatching
+        // through the entry table.
+        IntermediateOp::Return => Lowering::Fast,
+
         // Register-to-register arithmetic. Divide and remainder stay in the
         // helper so a zero divisor reaches the interpreter instead of trapping.
         IntermediateOp::Binary { kind, lhs, rhs, .. } => {
@@ -88,7 +100,8 @@ fn lowering(op: &IntermediateOp, types: &RegisterTypes) -> Lowering {
             }
         }
 
-        // Everything else — every value-stack touch, call, and return.
+        // Everything else: arithmetic and conditions that never got fused, so
+        // they still take their operands off the stack inside a helper.
         _ => Lowering::Helper,
     }
 }

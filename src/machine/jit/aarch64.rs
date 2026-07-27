@@ -109,10 +109,30 @@ impl Assembler {
         self.word(0xAA00_03E0 | (source << 16) | destination); // orr rd, xzr, rm
     }
 
+    /// `ldr Xt, [Xbase, #byte_offset]` — a word-aligned load.
+    fn load_from(&mut self, target: u32, base: u32, byte_offset: usize) {
+        let scaled = (byte_offset / 8) as u32;
+        self.word(0xF940_0000 | (scaled << 10) | (base << 5) | target);
+    }
+
     /// `ldr Xt, [x19, #byte_offset]` — a word-aligned load from the state.
     fn load(&mut self, target: u32, byte_offset: usize) {
-        let scaled = (byte_offset / 8) as u32;
-        self.word(0xF940_0000 | (scaled << 10) | (STATE << 5) | target);
+        self.load_from(target, STATE, byte_offset);
+    }
+
+    /// `ldrb Wt, [Xbase]` — reads a value's tag byte, which sits at offset zero.
+    fn load_tag(&mut self, target: u32, base: u32) {
+        self.word(0x3940_0000 | (base << 5) | target);
+    }
+
+    /// `cmp Wn, #value`.
+    fn compare_word_immediate(&mut self, register: u32, value: u32) {
+        self.word(0x7100_001F | (value << 10) | (register << 5));
+    }
+
+    /// `cmp Xn, #value`.
+    fn compare_immediate(&mut self, register: u32, value: u32) {
+        self.word(0xF100_001F | (value << 10) | (register << 5));
     }
 
     /// `str Xt, [x19, #byte_offset]`.
@@ -239,6 +259,43 @@ impl Assembler {
         self.branch_fixup(0x1400_0000, FixupKind::Imm26, FixupTarget::Epilogue); // b
     }
 
+    /// Returns without calling a helper: pop the call stack, confirm the value
+    /// is a return address inside the program, and dispatch through the entry
+    /// table. Anything unexpected — an empty stack, a foreign tag, a target past
+    /// the end — branches to `slow` so the helper reports the error the
+    /// interpreter would. The fast path always transfers control, so no branch
+    /// over the slow path is needed.
+    ///
+    /// `length` bounds the target. It is compared as a 12-bit immediate, so a
+    /// program with more ops than that keeps the helper.
+    pub(super) fn return_inline(
+        &mut self,
+        stack: StackFields,
+        length: u32,
+        tag: u8,
+        slow: impl FnOnce(&mut Self),
+    ) {
+        let mut checks = Vec::new();
+        // x1 holds the depth so x0 is free for the target the dispatch wants.
+        self.load(1, stack.length);
+        checks.push(self.forward(0xB400_0001, FixupKind::Imm19)); // cbz x1
+        self.subtract_immediate(1, 1, 1);
+        self.slot_address(stack, 1);
+        self.load_tag(3, 2);
+        self.compare_word_immediate(3, u32::from(tag));
+        checks.push(self.forward(0x5400_0001, FixupKind::Imm19)); // b.ne
+        self.load_from(0, 2, PAYLOAD_OFFSET);
+        self.compare_immediate(0, length);
+        checks.push(self.forward(0x5400_0002, FixupKind::Imm19)); // b.hs
+        self.store(1, stack.length);
+        self.word(0xF860_7800 | (TABLE << 5) | SCRATCH); // ldr x16, [x20, x0, lsl #3]
+        self.word(0xD61F_0000 | (SCRATCH << 5)); // br x16
+        for check in checks {
+            self.bind(check);
+        }
+        slow(self);
+    }
+
     pub(super) fn return_dispatch(&mut self) {
         self.compare_zero();
         self.branch_negative_epilogue();
@@ -351,11 +408,11 @@ impl Assembler {
         self.word(0x8B00_0000 | (index << 16) | (shift << 10) | (base << 5) | destination);
     }
 
-    /// Leaves `x2` pointing at the top slot of `stack` for a value at depth
-    /// `x0`, which the caller has already loaded and bounds-checked.
-    fn slot_address(&mut self, stack: StackFields) {
+    /// Leaves `x2` pointing at the slot `index` addresses in `stack`, where
+    /// `index` is a register the caller has already loaded and bounds-checked.
+    fn slot_address(&mut self, stack: StackFields, index: u32) {
         self.load(2, stack.data);
-        self.add_shifted(2, 2, 0, VALUE_SHIFT);
+        self.add_shifted(2, 2, index, VALUE_SHIFT);
     }
 
     /// Pushes a value onto `stack` without calling a helper: bounds-check the
@@ -375,7 +432,7 @@ impl Assembler {
         // b.hs — length and capacity are sizes, and length never exceeds
         // capacity, so this is taken exactly when the stack is full.
         checks.push(self.forward(0x5400_0002, FixupKind::Imm19));
-        self.slot_address(stack);
+        self.slot_address(stack, 0);
         match source {
             PushSource::Slot(offset) => self.load_pair(3, 4, STATE, offset),
             PushSource::PinnedSlot { slot, register } => {
@@ -412,7 +469,7 @@ impl Assembler {
         self.load(0, stack.length);
         checks.push(self.forward(0xB400_0000, FixupKind::Imm19)); // cbz x0
         self.subtract_immediate(0, 0, 1);
-        self.slot_address(stack);
+        self.slot_address(stack, 0);
         self.load_pair(3, 4, 2, 0);
         self.store_pair(3, 4, STATE, destination.slot);
         self.store(0, stack.length);

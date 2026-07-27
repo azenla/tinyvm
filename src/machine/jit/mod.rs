@@ -36,12 +36,11 @@ pub(super) fn uint64_tag() -> u8 {
     unsafe { *(&value as *const MachineValue as *const u8) }
 }
 
-/// The first of the two words a `MachineValue::ReturnAddress` occupies, which an
-/// inlined call pushes verbatim. Taken from a real value rather than assembled
-/// from the tag byte, so any padding the layout includes comes along.
-fn return_address_word() -> u64 {
+/// The tag byte identifying a `MachineValue::ReturnAddress`, which an inlined
+/// call writes and an inlined return checks.
+pub(super) fn return_address_tag() -> u8 {
     let value = MachineValue::ReturnAddress(0);
-    unsafe { *(&value as *const MachineValue as *const u64) }
+    unsafe { *(&value as *const MachineValue as *const u8) }
 }
 
 /// The offsets of the value stack's fields from the machine state pointer.
@@ -532,8 +531,11 @@ fn emit(
         IntermediateOp::Call(target) => {
             // Touches only the call stack, pushing a return address the two
             // words of which are both known here.
+            // Only the tag byte carries meaning in the first word, so the rest
+            // is written as zero rather than copied from a real value, whose
+            // padding bytes are not initialized.
             let source = PushSource::Words {
-                tag: return_address_word(),
+                tag: u64::from(return_address_tag()),
                 payload: (pc + 1) as u64,
             };
             assembler.push_inline(call_stack(), source, |assembler| {
@@ -546,12 +548,22 @@ fn emit(
             assembler.jump(*target);
         }
         IntermediateOp::Return => {
-            assembler.call(
-                helper::pop_return as *const (),
-                &[length as u64, position],
-                Spill::None,
-            );
-            assembler.return_dispatch();
+            let slow = |assembler: &mut Assembler| {
+                assembler.call(
+                    helper::pop_return as *const (),
+                    &[length as u64, position],
+                    Spill::None,
+                );
+                assembler.return_dispatch();
+            };
+            // The inlined range check compares against a 12-bit immediate, so
+            // longer programs keep the helper.
+            match u32::try_from(length) {
+                Ok(length) if length <= 0xFFF => {
+                    assembler.return_inline(call_stack(), length, return_address_tag(), slow);
+                }
+                _ => slow(assembler),
+            }
         }
         IntermediateOp::Exit => {
             // Only records the program counter; the epilogue makes the bank

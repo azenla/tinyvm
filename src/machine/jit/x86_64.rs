@@ -311,6 +311,45 @@ impl Assembler {
         self.branch_fixup(&[0xE9], FixupTarget::Epilogue); // jmp
     }
 
+    /// Returns without calling a helper: pop the call stack, confirm the value
+    /// is a return address inside the program, and dispatch through the entry
+    /// table. Anything unexpected — an empty stack, a foreign tag, a target past
+    /// the end — branches to `slow` so the helper reports the error the
+    /// interpreter would. The fast path always transfers control, so no branch
+    /// over the slow path is needed.
+    pub(super) fn return_inline(
+        &mut self,
+        stack: StackFields,
+        length: u32,
+        tag: u8,
+        slow: impl FnOnce(&mut Self),
+    ) {
+        let mut checks = Vec::new();
+        // rax holds the depth and rcx addresses the slot; the target goes to r8
+        // so the depth survives to be written back once every check has passed.
+        self.load(0, stack.length);
+        self.test_status();
+        checks.push(self.forward(&[0x0F, 0x84])); // jz
+        self.subtract_immediate(0, 1);
+        self.slot_address(stack);
+        self.bytes(&[0x80, 0x39, tag]); // cmp byte [rcx], tag
+        checks.push(self.forward(&[0x0F, 0x85])); // jne
+        self.load_from(8, 1, PAYLOAD_OFFSET);
+        self.rex(0, 8); // cmp r8, length
+        self.bytes(&[0x81, 0xF8]);
+        self.bytes(&length.to_le_bytes());
+        checks.push(self.forward(&[0x0F, 0x83])); // jae
+        // Every check passed, so the pop is committed and the target dispatched.
+        self.store(0, stack.length);
+        self.move_register(0, 8);
+        self.bytes(&[0x49, 0x8B, 0x04, 0xC4]); // mov rax, [r12 + rax*8]
+        self.bytes(&[0xFF, 0xE0]); // jmp rax
+        for check in checks {
+            self.bind(check);
+        }
+        slow(self);
+    }
+
     pub(super) fn return_dispatch(&mut self) {
         self.test_status();
         self.branch_negative_epilogue();

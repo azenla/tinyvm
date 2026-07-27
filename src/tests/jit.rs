@@ -301,6 +301,41 @@ fn inlined_calls_grow_the_call_stack() {
     }
 }
 
+// The inlined return checks the call stack itself, so both ways it can refuse
+// have to produce exactly the interpreter's error: nothing to return to, and a
+// return address past the end of the program, which the last op being a call
+// produces.
+#[test]
+fn inlined_return_errors_match_the_interpreter() {
+    static EMPTY: RawProgram = program!(op!(Return), op!(Exit));
+
+    // 0 jumps to 3, whose call pushes a return address of 4 — one past the last
+    // op — and jumps to the return at 1.
+    static PAST_END: RawProgram = program!(
+        op!(Jump, Instruction(3)),
+        op!(Return),
+        op!(Exit),
+        op!(Call, Instruction(1)),
+    );
+
+    for (program, expected) in [
+        (&EMPTY, MachineError::CallStackEmpty),
+        (&PAST_END, MachineError::InstructionOverflow),
+    ] {
+        let intermediate = IntermediateProgram::compile(program).unwrap();
+        let mut interpreter = Machine::new(ops::all());
+        let interpreter_error = interpreter
+            .run(&MachineProgram::Intermediate(intermediate))
+            .unwrap_err();
+
+        let mut jitted = Machine::new(ops::all());
+        let jit_error = jitted.run(&jit(program)).unwrap_err();
+
+        assert_eq!(jit_error, expected);
+        assert_eq!(jit_error, interpreter_error);
+    }
+}
+
 // An odd number of pinned registers pads the saved-register area for
 // alignment (x86_64) and pairs a register with the zero register (aarch64).
 // Popping then pushing three Uint64 registers pins three of them and routes
