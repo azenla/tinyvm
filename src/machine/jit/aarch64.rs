@@ -1,4 +1,6 @@
-use super::{FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, Spill};
+use super::{
+    FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, PushSource, Spill, StackFields,
+};
 use crate::machine::error::{MachineError, Result};
 
 // Register conventions for generated code: x19 holds the machine state
@@ -12,6 +14,9 @@ const TABLE: u32 = 20;
 const SCRATCH: u32 = 16;
 const ARGUMENTS: [u32; 3] = [0, 1, 2];
 const ZERO_REGISTER: u32 = 31;
+/// `lsl` amount that scales a stack index into a byte offset, since a
+/// `MachineValue` is sixteen bytes.
+const VALUE_SHIFT: u32 = 4;
 
 enum FixupKind {
     Imm26,
@@ -327,6 +332,94 @@ impl Assembler {
             Spill::One { register, slot } => self.store(register, slot + PAYLOAD_OFFSET),
             Spill::All => self.spill_pinned(),
         }
+    }
+
+    /// `ldp Xa, Xb, [Xbase, #byte_offset]` — loads both words of a value.
+    fn load_pair(&mut self, first: u32, second: u32, base: u32, byte_offset: usize) {
+        let scaled = ((byte_offset / 8) as u32) & 0x7F;
+        self.word(0xA940_0000 | (scaled << 15) | (second << 10) | (base << 5) | first);
+    }
+
+    /// `stp Xa, Xb, [Xbase, #byte_offset]` — stores both words of a value.
+    fn store_pair(&mut self, first: u32, second: u32, base: u32, byte_offset: usize) {
+        let scaled = ((byte_offset / 8) as u32) & 0x7F;
+        self.word(0xA900_0000 | (scaled << 15) | (second << 10) | (base << 5) | first);
+    }
+
+    /// `add Xd, Xn, Xm, lsl #shift`.
+    fn add_shifted(&mut self, destination: u32, base: u32, index: u32, shift: u32) {
+        self.word(0x8B00_0000 | (index << 16) | (shift << 10) | (base << 5) | destination);
+    }
+
+    /// Leaves `x2` pointing at the top slot of `stack` for a value at depth
+    /// `x0`, which the caller has already loaded and bounds-checked.
+    fn slot_address(&mut self, stack: StackFields) {
+        self.load(2, stack.data);
+        self.add_shifted(2, 2, 0, VALUE_SHIFT);
+    }
+
+    /// Pushes a value onto `stack` without calling a helper: bounds-check the
+    /// length against the capacity, store both words at the top, and write back
+    /// the incremented length. Returns the check that must reach the slow path,
+    /// taken when the stack is full and has to grow.
+    pub(super) fn push_inline(
+        &mut self,
+        stack: StackFields,
+        source: PushSource,
+        slow: impl FnOnce(&mut Self),
+    ) {
+        let mut checks = Vec::new();
+        self.load(0, stack.length);
+        self.load(1, stack.capacity);
+        self.compare_registers(0, 1);
+        // b.hs — length and capacity are sizes, and length never exceeds
+        // capacity, so this is taken exactly when the stack is full.
+        checks.push(self.forward(0x5400_0002, FixupKind::Imm19));
+        self.slot_address(stack);
+        match source {
+            PushSource::Slot(offset) => self.load_pair(3, 4, STATE, offset),
+            PushSource::PinnedSlot { slot, register } => {
+                self.load(3, slot);
+                self.move_register(4, register);
+            }
+            PushSource::Constant(address) => {
+                self.load_immediate(SCRATCH, address as u64);
+                self.load_pair(3, 4, SCRATCH, 0);
+            }
+            PushSource::Words { tag, payload } => {
+                self.load_immediate(3, tag);
+                self.load_immediate(4, payload);
+            }
+        }
+        self.store_pair(3, 4, 2, 0);
+        self.add_immediate(0, 0, 1);
+        self.store(0, stack.length);
+        self.slow_path(checks, slow);
+    }
+
+    /// Pops a value off `stack` into a register slot without calling a helper.
+    /// Both words go to the slot, so its tag stays right for helpers and
+    /// unproven reads, and a pinned destination also takes the payload directly
+    /// from the popped value. Returns the check taken when the stack is empty,
+    /// which must reach the slow path so the helper reports the error.
+    pub(super) fn pop_inline(
+        &mut self,
+        stack: StackFields,
+        destination: FastDest,
+        slow: impl FnOnce(&mut Self),
+    ) {
+        let mut checks = Vec::new();
+        self.load(0, stack.length);
+        checks.push(self.forward(0xB400_0000, FixupKind::Imm19)); // cbz x0
+        self.subtract_immediate(0, 0, 1);
+        self.slot_address(stack);
+        self.load_pair(3, 4, 2, 0);
+        self.store_pair(3, 4, STATE, destination.slot);
+        self.store(0, stack.length);
+        if let Some(register) = destination.pin {
+            self.move_register(register, 4);
+        }
+        self.slow_path(checks, slow);
     }
 
     fn slow_path(&mut self, checks: Vec<PendingBranch>, emit: impl FnOnce(&mut Self)) {

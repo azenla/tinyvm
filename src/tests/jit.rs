@@ -10,7 +10,7 @@ use crate::machine::value::MachineValue;
 use crate::machine::{Machine, MachineProgram, ops};
 use crate::op;
 use crate::op::OpArg::{Instruction, Register1, Register2, Register3, Uint32, Uint64};
-use crate::op::OpCode::{Add, Divide, Exit, JumpIfZero, Pop, Push};
+use crate::op::OpCode::{Add, Call, Divide, Exit, Jump, JumpIfZero, Pop, Push, Return, Subtract};
 use crate::program;
 use crate::program::RawProgram;
 
@@ -196,6 +196,109 @@ fn bank_is_coherent_after_an_error_exit() {
     assert_eq!(jit_error, interpreter_error);
     assert_eq!(interpreter.state().bank().get(0), MachineValue::Uint64(42));
     assert_eq!(jitted.state().bank(), interpreter.state().bank());
+}
+
+// The inlined push stores straight into the stack's buffer, so it has to hand
+// off to the helper once the buffer is full. Pushing far more values than the
+// initial capacity takes that branch repeatedly, and the buffer moves under the
+// generated code each time it grows.
+#[test]
+fn inlined_pushes_grow_the_value_stack() {
+    use crate::machine::optimizer::{OptimizedProgram, ValueType};
+
+    // Pushes r3, r3 - 1, ... 1 onto the stack, then a zero on top.
+    static PROGRAM: RawProgram = program!(
+        op!(Pop, Register3),
+        op!(Push, Register3),
+        op!(JumpIfZero, Instruction(9)),
+        op!(Push, Register3),
+        op!(Push, Register3),
+        op!(Push, Uint64(1)),
+        op!(Subtract),
+        op!(Pop, Register3),
+        op!(Jump, Instruction(1)),
+        op!(Push, Uint64(0)),
+        op!(Exit),
+    );
+
+    let depth = 200u64;
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
+    let jit = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
+    let interpreted = MachineProgram::Intermediate(intermediate);
+
+    let mut jitted = Machine::new(ops::all());
+    jitted.state().push(MachineValue::Uint64(depth));
+    jitted.run(&jit).unwrap();
+
+    let mut interpreter = Machine::new(ops::all());
+    interpreter.state().push(MachineValue::Uint64(depth));
+    interpreter.run(&interpreted).unwrap();
+
+    // The zero on top, then every pushed value back down to one.
+    assert_eq!(jitted.state().pop().unwrap(), MachineValue::Uint64(0));
+    for expected in 1..=depth {
+        assert_eq!(
+            jitted.state().pop().unwrap(),
+            MachineValue::Uint64(expected),
+            "value stack mismatch at {expected}"
+        );
+    }
+    // And nothing beyond that, matching the interpreter exactly.
+    assert_eq!(jitted.state().pop(), Err(MachineError::StackEmpty));
+    interpreter.state().pop().unwrap();
+    for _ in 1..=depth {
+        interpreter.state().pop().unwrap();
+    }
+    assert_eq!(interpreter.state().pop(), Err(MachineError::StackEmpty));
+}
+
+// `call` pushes onto the call stack inline, so deep recursion has to grow that
+// stack the same way, and every `ret` has to find the address its `call` left.
+#[test]
+fn inlined_calls_grow_the_call_stack() {
+    use crate::machine::optimizer::{OptimizedProgram, ValueType};
+
+    // Recurses r1 deep, then unwinds returning 42.
+    static PROGRAM: RawProgram = program!(
+        op!(Pop, Register1),
+        op!(Call, Instruction(3)),
+        op!(Exit),
+        op!(Push, Register1),
+        op!(JumpIfZero, Instruction(11)),
+        op!(Push, Register1),
+        op!(Push, Uint64(1)),
+        op!(Subtract),
+        op!(Pop, Register1),
+        op!(Call, Instruction(3)),
+        op!(Return),
+        op!(Push, Uint64(42)),
+        op!(Return),
+    );
+
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
+    let optimized = OptimizedProgram::compile_with_inputs(&intermediate, &[ValueType::Uint64]);
+    let jit = MachineProgram::Jit(JitProgram::compile_optimized(&optimized).unwrap());
+    let interpreted = MachineProgram::Intermediate(intermediate);
+
+    // 300 nests past the initial capacity, so the call stack grows more than
+    // once while return addresses are live in it.
+    for depth in [0u64, 1, 2, 63, 64, 65, 300] {
+        let mut jitted = Machine::new(ops::all());
+        jitted.state().push(MachineValue::Uint64(depth));
+        jitted.run(&jit).unwrap();
+
+        let mut interpreter = Machine::new(ops::all());
+        interpreter.state().push(MachineValue::Uint64(depth));
+        interpreter.run(&interpreted).unwrap();
+
+        assert_eq!(
+            jitted.state().pop().unwrap(),
+            interpreter.state().pop().unwrap(),
+            "result mismatch at depth {depth}"
+        );
+        assert_eq!(jitted.state().bank(), interpreter.state().bank());
+    }
 }
 
 // An odd number of pinned registers pads the saved-register area for

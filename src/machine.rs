@@ -8,6 +8,7 @@ use crate::machine::jit::JitProgram;
 use crate::machine::ops::{InlinedOpHandlers, OpHandlerSet};
 use crate::machine::optimizer::{OptimizedProgram, ValueType};
 use crate::machine::registers::RegisterBank;
+use crate::machine::stack::ValueStack;
 use crate::machine::value::MachineValue;
 use crate::op::{Op, OpArg};
 use crate::program::RawProgram;
@@ -22,6 +23,7 @@ pub mod jit;
 pub mod ops;
 pub mod optimizer;
 pub mod registers;
+pub mod stack;
 pub mod value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,8 +48,8 @@ pub enum MachineProgram<'program> {
 
 #[derive(Clone, Default)]
 pub struct MachineState {
-    stack: Vec<MachineValue>,
-    calls: Vec<MachineValue>,
+    stack: ValueStack,
+    calls: ValueStack,
     bank: RegisterBank,
     current: usize,
 }
@@ -86,14 +88,8 @@ impl MachineState {
     }
 
     pub fn reset(&mut self) {
-        if !self.stack.is_empty() {
-            self.stack.clear();
-        }
-
-        if !self.calls.is_empty() {
-            self.calls.clear();
-        }
-
+        self.stack.clear();
+        self.calls.clear();
         self.current = 0;
         self.bank.reset();
     }
@@ -119,7 +115,7 @@ impl MachineState {
         let Some(start) = self.stack.len().checked_sub(inputs.len()) else {
             return Err(MachineError::InputMismatch);
         };
-        for (value, expected) in self.stack[start..].iter().zip(inputs) {
+        for (value, expected) in self.stack.values()[start..].iter().zip(inputs) {
             if *expected != ValueType::Unknown && ValueType::of(value) != *expected {
                 return Err(MachineError::InputMismatch);
             }

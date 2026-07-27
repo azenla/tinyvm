@@ -1,4 +1,6 @@
-use super::{FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, Spill};
+use super::{
+    FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, PushSource, Spill, StackFields,
+};
 use crate::machine::error::{MachineError, Result};
 
 // Register conventions for generated code: rbx holds the machine state pointer,
@@ -12,6 +14,9 @@ use crate::machine::error::{MachineError, Result};
 // (8 bytes), so an odd count is padded with 8 extra frame bytes to preserve
 // alignment.
 const STATE: u8 = 3; // rbx (r12 holds the entry table, addressed inline)
+/// `shl` amount that scales a stack index into a byte offset, since a
+/// `MachineValue` is sixteen bytes.
+const VALUE_SHIFT: u8 = 4;
 
 #[cfg(windows)]
 const FRAME_BASE: u8 = 40;
@@ -96,18 +101,40 @@ impl Assembler {
         self.bytes(&value.to_le_bytes());
     }
 
+    /// `mov register, [base + byte_offset]`. `base` must not be `rsp` or `r12`,
+    /// whose encoding would need a SIB byte.
+    fn load_from(&mut self, register: u8, base: u8, byte_offset: usize) {
+        self.rex(register, base);
+        self.bytes(&[0x8B, 0x80 | ((register & 7) << 3) | (base & 7)]);
+        self.bytes(&(byte_offset as i32).to_le_bytes());
+    }
+
+    /// `mov [base + byte_offset], register`, with the same restriction on `base`.
+    fn store_to(&mut self, register: u8, base: u8, byte_offset: usize) {
+        self.rex(register, base);
+        self.bytes(&[0x89, 0x80 | ((register & 7) << 3) | (base & 7)]);
+        self.bytes(&(byte_offset as i32).to_le_bytes());
+    }
+
     /// `mov register, [rbx + byte_offset]` for any register.
     fn load(&mut self, register: u8, byte_offset: usize) {
-        self.rex(register, STATE);
-        self.bytes(&[0x8B, 0x80 | ((register & 7) << 3) | (STATE & 7)]);
-        self.bytes(&(byte_offset as i32).to_le_bytes());
+        self.load_from(register, STATE, byte_offset);
     }
 
     /// `mov [rbx + byte_offset], register` for any register.
     fn store(&mut self, register: u8, byte_offset: usize) {
-        self.rex(register, STATE);
-        self.bytes(&[0x89, 0x80 | ((register & 7) << 3) | (STATE & 7)]);
-        self.bytes(&(byte_offset as i32).to_le_bytes());
+        self.store_to(register, STATE, byte_offset);
+    }
+
+    fn compare_registers(&mut self, lhs: u8, rhs: u8) {
+        self.rex(rhs, lhs);
+        self.bytes(&[0x39, 0xC0 | ((rhs & 7) << 3) | (lhs & 7)]);
+    }
+
+    /// `shl register, amount`.
+    fn shift_left(&mut self, register: u8, amount: u8) {
+        self.rex(0, register);
+        self.bytes(&[0xC1, 0xE0 | (register & 7), amount]);
     }
 
     fn move_register(&mut self, destination: u8, source: u8) {
@@ -354,6 +381,88 @@ impl Assembler {
             self.memory(0, destination.slot as i32);
             self.bytes(&u32::from(super::uint64_tag()).to_le_bytes());
         }
+    }
+
+    /// Leaves `rcx` pointing at the slot `rax` indexes in `stack`. x86 scaled
+    /// addressing tops out at a factor of eight, so the shift is explicit and
+    /// goes through `rdx`, leaving `rax` holding the index.
+    fn slot_address(&mut self, stack: StackFields) {
+        self.load(1, stack.data);
+        self.move_register(2, 0);
+        self.shift_left(2, VALUE_SHIFT);
+        self.add_registers(1, 2);
+    }
+
+    /// Pushes a value onto `stack` without calling a helper: bounds-check the
+    /// length against the capacity, store both words at the top, and write back
+    /// the incremented length. The check reaching `slow` is taken when the stack
+    /// is full and has to grow.
+    pub(super) fn push_inline(
+        &mut self,
+        stack: StackFields,
+        source: PushSource,
+        slow: impl FnOnce(&mut Self),
+    ) {
+        let mut checks = Vec::new();
+        self.load(0, stack.length);
+        self.load(1, stack.capacity);
+        self.compare_registers(0, 1);
+        // jae — length and capacity are sizes and length never exceeds
+        // capacity, so this is taken exactly when the stack is full.
+        checks.push(self.forward(&[0x0F, 0x83]));
+        self.slot_address(stack);
+        match source {
+            PushSource::Slot(offset) => {
+                self.load(8, offset);
+                self.load(9, offset + PAYLOAD_OFFSET);
+            }
+            PushSource::PinnedSlot { slot, register } => {
+                self.load(8, slot);
+                self.move_register(9, register as u8);
+            }
+            PushSource::Constant(address) => {
+                self.move_immediate_register(2, address as u64);
+                self.load_from(8, 2, 0);
+                self.load_from(9, 2, PAYLOAD_OFFSET);
+            }
+            PushSource::Words { tag, payload } => {
+                self.move_immediate_register(8, tag);
+                self.move_immediate_register(9, payload);
+            }
+        }
+        self.store_to(8, 1, 0);
+        self.store_to(9, 1, PAYLOAD_OFFSET);
+        self.add_immediate(0, 1);
+        self.store(0, stack.length);
+        self.slow_path(checks, slow);
+    }
+
+    /// Pops a value off `stack` into a register slot without calling a helper.
+    /// Both words go to the slot, so its tag stays right for helpers and
+    /// unproven reads, and a pinned destination also takes the payload directly
+    /// from the popped value. The check reaching `slow` is taken when the stack
+    /// is empty, so the helper reports the error.
+    pub(super) fn pop_inline(
+        &mut self,
+        stack: StackFields,
+        destination: FastDest,
+        slow: impl FnOnce(&mut Self),
+    ) {
+        let mut checks = Vec::new();
+        self.load(0, stack.length);
+        self.test_status();
+        checks.push(self.forward(&[0x0F, 0x84])); // jz
+        self.subtract_immediate(0, 1);
+        self.slot_address(stack);
+        self.load_from(8, 1, 0);
+        self.load_from(9, 1, PAYLOAD_OFFSET);
+        self.store(8, destination.slot);
+        self.store(9, destination.slot + PAYLOAD_OFFSET);
+        self.store(0, stack.length);
+        if let Some(register) = destination.pin {
+            self.move_register(register as u8, 9);
+        }
+        self.slow_path(checks, slow);
     }
 
     fn slow_path(&mut self, checks: Vec<PendingBranch>, emit: impl FnOnce(&mut Self)) {

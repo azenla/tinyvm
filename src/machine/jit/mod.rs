@@ -3,6 +3,7 @@ use crate::machine::error::{MachineError, Result};
 use crate::machine::intermediate::{BinaryOpKind, IntermediateOp, IntermediateProgram, Source};
 use crate::machine::optimizer::{OptimizedProgram, RegisterTypes, ValueType};
 use crate::machine::registers::{REGISTER_BANK_COUNT, RegisterBank};
+use crate::machine::stack::ValueStack;
 use crate::machine::value::MachineValue;
 use std::sync::Arc;
 
@@ -33,6 +34,33 @@ pub(super) const PAYLOAD_OFFSET: usize = 8;
 pub(super) fn uint64_tag() -> u8 {
     let value = MachineValue::Uint64(0);
     unsafe { *(&value as *const MachineValue as *const u8) }
+}
+
+/// The first of the two words a `MachineValue::ReturnAddress` occupies, which an
+/// inlined call pushes verbatim. Taken from a real value rather than assembled
+/// from the tag byte, so any padding the layout includes comes along.
+fn return_address_word() -> u64 {
+    let value = MachineValue::ReturnAddress(0);
+    unsafe { *(&value as *const MachineValue as *const u64) }
+}
+
+/// The offsets of the value stack's fields from the machine state pointer.
+fn stack_of(offset: usize) -> StackFields {
+    StackFields {
+        length: offset + ValueStack::length_offset(),
+        capacity: offset + ValueStack::capacity_offset(),
+        data: offset + ValueStack::data_offset(),
+    }
+}
+
+/// The stack `push` and `pop` operate on.
+fn value_stack() -> StackFields {
+    stack_of(std::mem::offset_of!(MachineState, stack))
+}
+
+/// The stack `call` and `ret` operate on.
+fn call_stack() -> StackFields {
+    stack_of(std::mem::offset_of!(MachineState, calls))
 }
 
 /// An operand a fast path can evaluate without calling a helper.
@@ -78,6 +106,30 @@ pub(super) struct FastBinary {
     pub helper: *const (),
     pub op: u64,
     pub write_tag: bool,
+}
+
+/// Where one of the machine's stacks keeps the fields generated code touches,
+/// as byte offsets from the state pointer. An inlined push compares `length`
+/// against `capacity` and stores through `data`.
+#[derive(Clone, Copy)]
+pub(super) struct StackFields {
+    pub length: usize,
+    pub capacity: usize,
+    pub data: usize,
+}
+
+/// The value an inlined push writes, as the two words of a `MachineValue`.
+#[derive(Clone, Copy)]
+pub(super) enum PushSource {
+    /// Both words sit at this byte offset from the state pointer.
+    Slot(usize),
+    /// A pinned register's slot: the tag word is in memory, but the payload
+    /// lives in the cpu register, its memory copy being stale between spills.
+    PinnedSlot { slot: usize, register: u32 },
+    /// Both words sit at this absolute address.
+    Constant(usize),
+    /// The tag word and the payload word, as immediates.
+    Words { tag: u64, payload: u64 },
 }
 
 /// Which pinned registers a helper needs written back to the bank before it
@@ -199,6 +251,9 @@ fn allocate(
 
     for (pc, op) in ops.iter().enumerate() {
         match op {
+            // Both are inlined, but neither disqualifies: a push takes the
+            // payload from the pinned register rather than the slot behind it,
+            // and a pop writes the register as well as the slot.
             IntermediateOp::PushRegister(index) | IntermediateOp::PopRegister(index) => {
                 usage[*index] += 1;
             }
@@ -387,33 +442,50 @@ fn emit(
     let data = op as *const IntermediateOp as u64;
     let position = pc as u64;
     match op {
-        IntermediateOp::PushValue(_) => {
-            assembler.call(helper::push_value as *const (), &[data], Spill::None);
+        IntermediateOp::PushValue(value) => {
+            // The value lives in the op itself, which the compiled program keeps
+            // alive, so the generated code copies it straight from there.
+            let address = value as *const MachineValue as usize;
+            assembler.push_inline(value_stack(), PushSource::Constant(address), |assembler| {
+                assembler.call(helper::push_value as *const (), &[data], Spill::None);
+            });
         }
         IntermediateOp::PushRegister(index) => {
-            // Reads one bank slot, so only that register needs flushing.
-            assembler.call(
-                helper::push_register as *const (),
-                &[data],
-                spill_of(*index, pins),
-            );
+            // The pushed value is the whole slot, tag included, but a pinned
+            // register's slot payload is stale between spills, so the payload
+            // comes from the cpu register instead. The helper on the slow path
+            // reads the bank, so it still needs the spill.
+            let source = match pin_of(*index, pins) {
+                Some(register) => PushSource::PinnedSlot {
+                    slot: slot(*index),
+                    register,
+                },
+                None => PushSource::Slot(slot(*index)),
+            };
+            let spill = spill_of(*index, pins);
+            assembler.push_inline(value_stack(), source, |assembler| {
+                assembler.call(helper::push_register as *const (), &[data], spill);
+            });
         }
         IntermediateOp::PopRegister(index) => {
-            // Writes one bank slot and reads none, so nothing needs flushing
-            // first.
-            assembler.call(
-                helper::pop_register as *const (),
-                &[data, position],
-                Spill::None,
-            );
-            assembler.check_error();
-            // Refresh only the register the helper wrote. Reloading the rest
-            // would overwrite live payloads with the stale slots behind them,
-            // and doing it after the error check keeps a failed pop from
-            // pulling a stale payload into a pinned register.
-            if let Some(register) = pin_of(*index, pins) {
-                assembler.reload_one(register, slot(*index));
-            }
+            let destination = dest(*index, pins);
+            assembler.pop_inline(value_stack(), destination, |assembler| {
+                // Writes one bank slot and reads none, so nothing needs
+                // flushing first.
+                assembler.call(
+                    helper::pop_register as *const (),
+                    &[data, position],
+                    Spill::None,
+                );
+                assembler.check_error();
+                // Refresh only the register the helper wrote. Reloading the rest
+                // would overwrite live payloads with the stale slots behind
+                // them, and doing it after the error check keeps a failed pop
+                // from pulling a stale payload into a pinned register.
+                if let Some(register) = destination.pin {
+                    assembler.reload_one(register, destination.slot);
+                }
+            });
         }
         IntermediateOp::Add
         | IntermediateOp::Subtract
@@ -458,12 +530,19 @@ fn emit(
             assembler.jump(*target);
         }
         IntermediateOp::Call(target) => {
-            // Touches only the call stack.
-            assembler.call(
-                helper::push_call as *const (),
-                &[(pc + 1) as u64],
-                Spill::None,
-            );
+            // Touches only the call stack, pushing a return address the two
+            // words of which are both known here.
+            let source = PushSource::Words {
+                tag: return_address_word(),
+                payload: (pc + 1) as u64,
+            };
+            assembler.push_inline(call_stack(), source, |assembler| {
+                assembler.call(
+                    helper::push_call as *const (),
+                    &[(pc + 1) as u64],
+                    Spill::None,
+                );
+            });
             assembler.jump(*target);
         }
         IntermediateOp::Return => {
