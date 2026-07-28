@@ -137,8 +137,36 @@ impl Assembler {
 
     /// `str Xt, [x19, #byte_offset]`.
     fn store(&mut self, source: u32, byte_offset: usize) {
+        self.store_to(source, STATE, byte_offset);
+    }
+
+    /// `str Xt, [Xbase, #byte_offset]`.
+    fn store_to(&mut self, source: u32, base: u32, byte_offset: usize) {
         let scaled = (byte_offset / 8) as u32;
-        self.word(0xF900_0000 | (scaled << 10) | (STATE << 5) | source);
+        self.word(0xF900_0000 | (scaled << 10) | (base << 5) | source);
+    }
+
+    /// Both words of a value, as two single loads rather than one `ldp`.
+    ///
+    /// A `MachineValue` is sixteen bytes, so a pair instruction moves one in a
+    /// single op, and the two-instruction form looks like a plain regression.
+    /// It is not: Apple cores do not forward a pair store to a pair load, so an
+    /// `stp` followed by an `ldp` of the same address stalls the load until the
+    /// store reaches L1. Moving a value through the value stack or the register
+    /// bank does exactly that — a `pop` writing a bank slot feeds the `push`
+    /// that reads it back — which put a store-buffer stall on the loop-carried
+    /// dependency of every stack-using program. Two eight-byte accesses forward
+    /// normally and cost a cycle of issue instead of the stall.
+    fn load_split(&mut self, first: u32, second: u32, base: u32, byte_offset: usize) {
+        self.load_from(first, base, byte_offset);
+        self.load_from(second, base, byte_offset + 8);
+    }
+
+    /// Both words of a value, as two single stores rather than one `stp`, so the
+    /// load that reads them back can forward. See [`Self::load_split`].
+    fn store_split(&mut self, first: u32, second: u32, base: u32, byte_offset: usize) {
+        self.store_to(first, base, byte_offset);
+        self.store_to(second, base, byte_offset + 8);
     }
 
     fn add_registers(&mut self, destination: u32, lhs: u32, rhs: u32) {
@@ -391,18 +419,6 @@ impl Assembler {
         }
     }
 
-    /// `ldp Xa, Xb, [Xbase, #byte_offset]` — loads both words of a value.
-    fn load_pair(&mut self, first: u32, second: u32, base: u32, byte_offset: usize) {
-        let scaled = ((byte_offset / 8) as u32) & 0x7F;
-        self.word(0xA940_0000 | (scaled << 15) | (second << 10) | (base << 5) | first);
-    }
-
-    /// `stp Xa, Xb, [Xbase, #byte_offset]` — stores both words of a value.
-    fn store_pair(&mut self, first: u32, second: u32, base: u32, byte_offset: usize) {
-        let scaled = ((byte_offset / 8) as u32) & 0x7F;
-        self.word(0xA900_0000 | (scaled << 15) | (second << 10) | (base << 5) | first);
-    }
-
     /// `add Xd, Xn, Xm, lsl #shift`.
     fn add_shifted(&mut self, destination: u32, base: u32, index: u32, shift: u32) {
         self.word(0x8B00_0000 | (index << 16) | (shift << 10) | (base << 5) | destination);
@@ -434,21 +450,21 @@ impl Assembler {
         checks.push(self.forward(0x5400_0002, FixupKind::Imm19));
         self.slot_address(stack, 0);
         match source {
-            PushSource::Slot(offset) => self.load_pair(3, 4, STATE, offset),
+            PushSource::Slot(offset) => self.load_split(3, 4, STATE, offset),
             PushSource::PinnedSlot { slot, register } => {
                 self.load(3, slot);
                 self.move_register(4, register);
             }
             PushSource::Constant(address) => {
                 self.load_immediate(SCRATCH, address as u64);
-                self.load_pair(3, 4, SCRATCH, 0);
+                self.load_split(3, 4, SCRATCH, 0);
             }
             PushSource::Words { tag, payload } => {
                 self.load_immediate(3, tag);
                 self.load_immediate(4, payload);
             }
         }
-        self.store_pair(3, 4, 2, 0);
+        self.store_split(3, 4, 2, 0);
         self.add_immediate(0, 0, 1);
         self.store(0, stack.length);
         self.slow_path(checks, slow);
@@ -470,8 +486,8 @@ impl Assembler {
         checks.push(self.forward(0xB400_0000, FixupKind::Imm19)); // cbz x0
         self.subtract_immediate(0, 0, 1);
         self.slot_address(stack, 0);
-        self.load_pair(3, 4, 2, 0);
-        self.store_pair(3, 4, STATE, destination.slot);
+        self.load_split(3, 4, 2, 0);
+        self.store_split(3, 4, STATE, destination.slot);
         self.store(0, stack.length);
         if let Some(register) = destination.pin {
             self.move_register(register, 4);
@@ -557,14 +573,14 @@ impl Assembler {
     }
 
     pub(super) fn copy_slot(&mut self, source: usize, destination: usize) {
-        self.word(0xA940_0400 | (((source / 8) as u32) << 15) | (STATE << 5)); // ldp x0, x1, [x19, #source]
-        self.word(0xA900_0400 | (((destination / 8) as u32) << 15) | (STATE << 5)); // stp x0, x1, [x19, #destination]
+        self.load_split(0, 1, STATE, source);
+        self.store_split(0, 1, STATE, destination);
     }
 
     pub(super) fn copy_constant(&mut self, constant: usize, destination: usize) {
         self.load_immediate(SCRATCH, constant as u64);
-        self.word(0xA940_0400 | (SCRATCH << 5)); // ldp x0, x1, [x16]
-        self.word(0xA900_0400 | (((destination / 8) as u32) << 15) | (STATE << 5)); // stp x0, x1, [x19, #destination]
+        self.load_split(0, 1, SCRATCH, 0);
+        self.store_split(0, 1, STATE, destination);
     }
 
     pub(super) fn jump_if_zero_fast(
