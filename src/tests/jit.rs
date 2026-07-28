@@ -10,7 +10,9 @@ use crate::machine::value::MachineValue;
 use crate::machine::{Machine, MachineProgram, ops};
 use crate::op;
 use crate::op::OpArg::{Instruction, Register1, Register2, Register3, Uint32, Uint64};
-use crate::op::OpCode::{Add, Call, Divide, Exit, Jump, JumpIfZero, Pop, Push, Return, Subtract};
+use crate::op::OpCode::{
+    Add, Call, CountLeadingZeros, Divide, Exit, Jump, JumpIfZero, Pop, Push, Return, Subtract,
+};
 use crate::program;
 use crate::program::RawProgram;
 
@@ -251,6 +253,45 @@ fn inlined_pushes_grow_the_value_stack() {
         interpreter.state().pop().unwrap();
     }
     assert_eq!(interpreter.state().pop(), Err(MachineError::StackEmpty));
+}
+
+// Inlined pushes leave the value stack's length in a cpu register, so a helper
+// that reaches the stack through the machine state has to be handed it first.
+// A count op never fuses, so it always goes out of line, and it pops — which it
+// can only do correctly if the three pushes before it are accounted for. A stale
+// length would have it read the wrong slot, or refuse an empty stack.
+#[test]
+fn stack_helpers_see_what_inlined_pushes_left() {
+    static PROGRAM: RawProgram = program!(
+        op!(Push, Uint64(11)),
+        op!(Push, Uint64(22)),
+        op!(Push, Uint64(5)),
+        op!(CountLeadingZeros),
+        op!(Pop, Register1),
+        op!(Push, Register1),
+        op!(Exit),
+    );
+
+    let mut jitted = Machine::new(ops::all());
+    jitted.run(&jit(&PROGRAM)).unwrap();
+
+    let mut interpreter = Machine::new(ops::all());
+    let intermediate = IntermediateProgram::compile(&PROGRAM).unwrap();
+    interpreter
+        .run(&MachineProgram::Intermediate(intermediate))
+        .unwrap();
+
+    // The counted value, then the two pushes it was stacked on, then nothing:
+    // the whole stack the run left, not just its top.
+    assert_eq!(jitted.state().pop().unwrap(), MachineValue::Uint32(61));
+    assert_eq!(jitted.state().pop().unwrap(), MachineValue::Uint64(22));
+    assert_eq!(jitted.state().pop().unwrap(), MachineValue::Uint64(11));
+    assert_eq!(jitted.state().pop(), Err(MachineError::StackEmpty));
+    for _ in 0..3 {
+        interpreter.state().pop().unwrap();
+    }
+    assert_eq!(interpreter.state().pop(), Err(MachineError::StackEmpty));
+    assert_eq!(jitted.state().bank(), interpreter.state().bank());
 }
 
 // `call` pushes onto the call stack inline, so deep recursion has to grow that

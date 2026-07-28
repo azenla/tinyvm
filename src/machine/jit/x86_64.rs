@@ -1,5 +1,6 @@
 use super::{
     FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, PushSource, Spill, StackFields,
+    StackKind,
 };
 use crate::machine::error::{MachineError, Result};
 
@@ -8,6 +9,11 @@ use crate::machine::error::{MachineError, Result};
 // and dl the tag scratch. r13/r14/r15/rbp are handed to the register allocator
 // to pin hot VM registers (callee-saved, so they survive helper calls). Helper
 // argument registers differ between the System V and Windows x64 conventions.
+//
+// That leaves r10 and r11 — caller-saved under both conventions and argument
+// registers under neither — for the value stack's `length` and `data`. There is
+// nothing left for its `capacity` or for the call stack, so those stay in
+// memory; sixteen registers do not go as far as thirty-two.
 //
 // The frame keeps rsp 16-byte aligned at every call site; Windows additionally
 // requires 32 bytes of shadow space above rsp. Each pinned register is pushed
@@ -22,6 +28,52 @@ const VALUE_SHIFT: u8 = 4;
 const FRAME_BASE: u8 = 40;
 #[cfg(not(windows))]
 const FRAME_BASE: u8 = 8;
+
+/// The cpu registers one stack's fields are kept in. These are caller-saved, so
+/// they say nothing across a helper call and are reloaded after every one; that
+/// is wanted anyway, since a helper that grows a stack moves its buffer.
+#[derive(Clone, Copy)]
+struct StackPins {
+    length: Option<u32>,
+    capacity: Option<u32>,
+    data: Option<u32>,
+}
+
+fn pins_of(kind: StackKind) -> StackPins {
+    match kind {
+        StackKind::Value => StackPins {
+            length: Some(10),
+            capacity: None,
+            data: Some(11),
+        },
+        StackKind::Call => StackPins {
+            length: None,
+            capacity: None,
+            data: None,
+        },
+    }
+}
+
+/// Every stack field held in a cpu register, as `(register, offset, written)`.
+/// `written` marks the ones generated code updates — the lengths — which are the
+/// only ones that have to reach memory again.
+fn stack_pins() -> Vec<(u8, usize, bool)> {
+    let mut pins = Vec::new();
+    for kind in StackKind::ALL {
+        let fields = super::stack_fields(kind);
+        let held = pins_of(kind);
+        for (pin, offset, written) in [
+            (held.length, fields.length, true),
+            (held.capacity, fields.capacity, false),
+            (held.data, fields.data, false),
+        ] {
+            if let Some(register) = pin {
+                pins.push((register as u8, offset, written));
+            }
+        }
+    }
+    pins
+}
 
 enum FixupTarget {
     Op(usize),
@@ -187,6 +239,52 @@ impl Assembler {
         self.bytes(&[0x48, 0x85, 0xC0]); // test rax, rax
     }
 
+    /// `test register, register`, for a zero check on something other than rax.
+    fn test_register(&mut self, register: u8) {
+        self.rex(register, register);
+        self.bytes(&[0x85, 0xC0 | ((register & 7) << 3) | (register & 7)]);
+    }
+
+    /// Reads every held stack field out of the state.
+    fn load_stack_pins(&mut self) {
+        for (register, offset, _) in stack_pins() {
+            self.load(register, offset);
+        }
+    }
+
+    /// Writes back the held stack fields generated code updates, so whatever
+    /// reads the state next — a helper, or the machine once generated code
+    /// returns — sees the length the generated code has been keeping.
+    fn spill_stack_pins(&mut self) {
+        for (register, offset, written) in stack_pins() {
+            if written {
+                self.store(register, offset);
+            }
+        }
+    }
+
+    /// The register a stack field is held in, or `scratch` once the field has
+    /// been loaded into it.
+    fn stack_field(&mut self, pin: Option<u32>, offset: usize, scratch: u8) -> u8 {
+        match pin {
+            Some(register) => register as u8,
+            None => {
+                self.load(scratch, offset);
+                scratch
+            }
+        }
+    }
+
+    /// Commits a length computed in `source`: nothing to do when `source` is
+    /// already the register the length is held in.
+    fn set_stack_length(&mut self, pin: Option<u32>, offset: usize, source: u8) {
+        match pin {
+            Some(register) if register as u8 == source => {}
+            Some(register) => self.move_register(register as u8, source),
+            None => self.store(source, offset),
+        }
+    }
+
     fn branch_negative_epilogue(&mut self) {
         self.branch_fixup(&[0x0F, 0x88], FixupTarget::Epilogue); // js
     }
@@ -212,6 +310,7 @@ impl Assembler {
         for (register, slot) in &pinned {
             self.load(*register as u8, slot + PAYLOAD_OFFSET);
         }
+        self.load_stack_pins();
         #[cfg(windows)]
         self.bytes(&[0xFF, 0xE2]); // jmp rdx
         #[cfg(not(windows))]
@@ -221,9 +320,16 @@ impl Assembler {
     /// The single exit from generated code. Pinned registers hold payloads their
     /// bank slots do not, so they are written back here, once, rather than at
     /// every call along the way.
+    ///
+    /// The stack length goes back too, though as it stands every path that
+    /// reaches here ran a helper first — `Exit`, the overflow stub, a failed
+    /// check — and a helper call already spills it. Writing it anyway makes
+    /// coherence on the way out a property of the exit itself, not of what each
+    /// path happens to do on its way to it.
     pub(super) fn epilogue(&mut self) {
         self.epilogue_offset = self.code.len();
         self.spill_pinned();
+        self.spill_stack_pins();
         let pinned = self.pinned.clone();
         let frame = self.frame();
         self.bytes(&[0x48, 0x83, 0xC4, frame]); // add rsp, frame
@@ -275,6 +381,12 @@ impl Assembler {
         // Flush whatever the helper reads from the bank; callers reload
         // afterward if it may have written the bank.
         self.apply_spill(spill);
+        // A helper reaches the stacks through the state, so the length held in a
+        // register goes back to memory before it runs and every held field is
+        // read again after: it may have pushed, popped, or grown a stack, and
+        // growing one moves its buffer. The reload leaves rax alone, which is
+        // where the helper's status is waiting.
+        self.spill_stack_pins();
         #[cfg(windows)]
         self.bytes(&[0x48, 0x89, 0xD9]); // mov rcx, rbx
         #[cfg(not(windows))]
@@ -285,6 +397,7 @@ impl Assembler {
         }
         self.move_immediate(0x48, 0, function as u64); // mov rax, function
         self.bytes(&[0xFF, 0xD0]); // call rax
+        self.load_stack_pins();
     }
 
     pub(super) fn check_error(&mut self) {
@@ -324,14 +437,19 @@ impl Assembler {
         tag: u8,
         slow: impl FnOnce(&mut Self),
     ) {
+        let pins = pins_of(stack.kind);
         let mut checks = Vec::new();
-        // rax holds the depth and rcx addresses the slot; the target goes to r8
-        // so the depth survives to be written back once every check has passed.
-        self.load(0, stack.length);
-        self.test_status();
+        // The popped depth is built in rax and rcx addresses the slot; the target
+        // goes to r8 so the depth survives to be committed once every check has
+        // passed, which also keeps a held depth intact until then.
+        let depth = self.stack_field(pins.length, stack.length, 0);
+        self.test_register(depth);
         checks.push(self.forward(&[0x0F, 0x84])); // jz
+        if depth != 0 {
+            self.move_register(0, depth);
+        }
         self.subtract_immediate(0, 1);
-        self.slot_address(stack);
+        self.slot_address(stack, 0);
         self.bytes(&[0x80, 0x39, tag]); // cmp byte [rcx], tag
         checks.push(self.forward(&[0x0F, 0x85])); // jne
         self.load_from(8, 1, PAYLOAD_OFFSET);
@@ -340,7 +458,7 @@ impl Assembler {
         self.bytes(&length.to_le_bytes());
         checks.push(self.forward(&[0x0F, 0x83])); // jae
         // Every check passed, so the pop is committed and the target dispatched.
-        self.store(0, stack.length);
+        self.set_stack_length(pins.length, stack.length, 0);
         self.move_register(0, 8);
         self.bytes(&[0x49, 0x8B, 0x04, 0xC4]); // mov rax, [r12 + rax*8]
         self.bytes(&[0xFF, 0xE0]); // jmp rax
@@ -422,14 +540,20 @@ impl Assembler {
         }
     }
 
-    /// Leaves `rcx` pointing at the slot `rax` indexes in `stack`. x86 scaled
-    /// addressing tops out at a factor of eight, so the shift is explicit and
-    /// goes through `rdx`, leaving `rax` holding the index.
-    fn slot_address(&mut self, stack: StackFields) {
-        self.load(1, stack.data);
-        self.move_register(2, 0);
-        self.shift_left(2, VALUE_SHIFT);
-        self.add_registers(1, 2);
+    /// Leaves `rcx` pointing at the slot `index` addresses in `stack`. x86 scaled
+    /// addressing tops out at a factor of eight, so the shift is explicit; it is
+    /// done in `rcx` itself, which leaves `index` intact and needs `rdx` only
+    /// when `data` had to be loaded.
+    fn slot_address(&mut self, stack: StackFields, index: u8) {
+        self.move_register(1, index);
+        self.shift_left(1, VALUE_SHIFT);
+        match pins_of(stack.kind).data {
+            Some(register) => self.add_registers(1, register as u8),
+            None => {
+                self.load(2, stack.data);
+                self.add_registers(1, 2);
+            }
+        }
     }
 
     /// Pushes a value onto `stack` without calling a helper: bounds-check the
@@ -442,14 +566,15 @@ impl Assembler {
         source: PushSource,
         slow: impl FnOnce(&mut Self),
     ) {
+        let pins = pins_of(stack.kind);
         let mut checks = Vec::new();
-        self.load(0, stack.length);
-        self.load(1, stack.capacity);
-        self.compare_registers(0, 1);
+        let length = self.stack_field(pins.length, stack.length, 0);
+        let capacity = self.stack_field(pins.capacity, stack.capacity, 1);
+        self.compare_registers(length, capacity);
         // jae — length and capacity are sizes and length never exceeds
         // capacity, so this is taken exactly when the stack is full.
         checks.push(self.forward(&[0x0F, 0x83]));
-        self.slot_address(stack);
+        self.slot_address(stack, length);
         match source {
             PushSource::Slot(offset) => {
                 self.load(8, offset);
@@ -471,8 +596,10 @@ impl Assembler {
         }
         self.store_to(8, 1, 0);
         self.store_to(9, 1, PAYLOAD_OFFSET);
-        self.add_immediate(0, 1);
-        self.store(0, stack.length);
+        // Past the only check, so the length can move on: in place when it is
+        // held in a register, and through the scratch it was loaded into if not.
+        self.add_immediate(length, 1);
+        self.set_stack_length(pins.length, stack.length, length);
         self.slow_path(checks, slow);
     }
 
@@ -487,17 +614,19 @@ impl Assembler {
         destination: FastDest,
         slow: impl FnOnce(&mut Self),
     ) {
+        let pins = pins_of(stack.kind);
         let mut checks = Vec::new();
-        self.load(0, stack.length);
-        self.test_status();
+        let length = self.stack_field(pins.length, stack.length, 0);
+        self.test_register(length);
         checks.push(self.forward(&[0x0F, 0x84])); // jz
-        self.subtract_immediate(0, 1);
-        self.slot_address(stack);
+        // The empty check is the only way out, so the pop is already committed.
+        self.subtract_immediate(length, 1);
+        self.slot_address(stack, length);
         self.load_from(8, 1, 0);
         self.load_from(9, 1, PAYLOAD_OFFSET);
         self.store(8, destination.slot);
         self.store(9, destination.slot + PAYLOAD_OFFSET);
-        self.store(0, stack.length);
+        self.set_stack_length(pins.length, stack.length, length);
         if let Some(register) = destination.pin {
             self.move_register(register as u8, 9);
         }

@@ -44,23 +44,41 @@ pub(super) fn return_address_tag() -> u8 {
     unsafe { *(&value as *const MachineValue as *const u8) }
 }
 
-/// The offsets of the value stack's fields from the machine state pointer.
-fn stack_of(offset: usize) -> StackFields {
+/// Which of the machine's two stacks a `StackFields` describes. A backend with
+/// registers to spare keeps some of these fields in them, so it has to know
+/// which stack it is looking at to find the ones it kept.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum StackKind {
+    /// The stack `push` and `pop` operate on.
+    Value,
+    /// The stack `call` and `ret` operate on.
+    Call,
+}
+
+impl StackKind {
+    pub(super) const ALL: [StackKind; 2] = [StackKind::Value, StackKind::Call];
+}
+
+/// The offsets of one stack's fields from the machine state pointer.
+pub(super) fn stack_fields(kind: StackKind) -> StackFields {
+    let offset = match kind {
+        StackKind::Value => std::mem::offset_of!(MachineState, stack),
+        StackKind::Call => std::mem::offset_of!(MachineState, calls),
+    };
     StackFields {
+        kind,
         length: offset + ValueStack::length_offset(),
         capacity: offset + ValueStack::capacity_offset(),
         data: offset + ValueStack::data_offset(),
     }
 }
 
-/// The stack `push` and `pop` operate on.
 fn value_stack() -> StackFields {
-    stack_of(std::mem::offset_of!(MachineState, stack))
+    stack_fields(StackKind::Value)
 }
 
-/// The stack `call` and `ret` operate on.
 fn call_stack() -> StackFields {
-    stack_of(std::mem::offset_of!(MachineState, calls))
+    stack_fields(StackKind::Call)
 }
 
 /// An operand a fast path can evaluate without calling a helper.
@@ -110,9 +128,11 @@ pub(super) struct FastBinary {
 
 /// Where one of the machine's stacks keeps the fields generated code touches,
 /// as byte offsets from the state pointer. An inlined push compares `length`
-/// against `capacity` and stores through `data`.
+/// against `capacity` and stores through `data`. `kind` names the stack, which
+/// is how a backend finds any of these it holds in a cpu register instead.
 #[derive(Clone, Copy)]
 pub(super) struct StackFields {
+    pub kind: StackKind,
     pub length: usize,
     pub capacity: usize,
     pub data: usize,

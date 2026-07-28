@@ -1,5 +1,6 @@
 use super::{
     FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, PushSource, Spill, StackFields,
+    StackKind,
 };
 use crate::machine::error::{MachineError, Result};
 
@@ -8,7 +9,8 @@ use crate::machine::error::{MachineError, Result};
 // intra-procedure scratch register used for helper addresses. x0/x1 are
 // operand scratch and w2 the tag scratch; x21-x28 are handed to the register
 // allocator to pin hot VM registers (callee-saved, so they survive helper
-// calls untouched).
+// calls untouched). x5-x10 hold both stacks' `length`, `capacity` and `data`,
+// which is what lets a push or a pop touch memory only for the value it moves.
 const STATE: u32 = 19;
 const TABLE: u32 = 20;
 const SCRATCH: u32 = 16;
@@ -17,6 +19,52 @@ const ZERO_REGISTER: u32 = 31;
 /// `lsl` amount that scales a stack index into a byte offset, since a
 /// `MachineValue` is sixteen bytes.
 const VALUE_SHIFT: u32 = 4;
+
+/// The cpu registers one stack's fields are kept in. These are caller-saved, so
+/// they say nothing across a helper call and are reloaded after every one; that
+/// is wanted anyway, since a helper that grows a stack moves its buffer.
+#[derive(Clone, Copy)]
+struct StackPins {
+    length: Option<u32>,
+    capacity: Option<u32>,
+    data: Option<u32>,
+}
+
+fn pins_of(kind: StackKind) -> StackPins {
+    match kind {
+        StackKind::Value => StackPins {
+            length: Some(5),
+            capacity: Some(6),
+            data: Some(7),
+        },
+        StackKind::Call => StackPins {
+            length: Some(8),
+            capacity: Some(9),
+            data: Some(10),
+        },
+    }
+}
+
+/// Every stack field held in a cpu register, as `(register, offset, written)`.
+/// `written` marks the ones generated code updates — the lengths — which are the
+/// only ones that have to reach memory again.
+fn stack_pins() -> Vec<(u32, usize, bool)> {
+    let mut pins = Vec::new();
+    for kind in StackKind::ALL {
+        let fields = super::stack_fields(kind);
+        let held = pins_of(kind);
+        for (pin, offset, written) in [
+            (held.length, fields.length, true),
+            (held.capacity, fields.capacity, false),
+            (held.data, fields.data, false),
+        ] {
+            if let Some(register) = pin {
+                pins.push((register, offset, written));
+            }
+        }
+    }
+    pins
+}
 
 enum FixupKind {
     Imm26,
@@ -218,15 +266,23 @@ impl Assembler {
         for (register, slot) in &pinned {
             self.load(*register, slot + PAYLOAD_OFFSET);
         }
+        self.load_stack_pins();
         self.word(0xD61F_0020); // br x1
     }
 
     /// The single exit from generated code. Pinned registers hold payloads their
     /// bank slots do not, so they are written back here, once, rather than at
     /// every call along the way.
+    ///
+    /// The stack lengths go back too, though as it stands every path that
+    /// reaches here ran a helper first — `Exit`, the overflow stub, a failed
+    /// check — and a helper call already spills them. Writing them anyway makes
+    /// coherence on the way out a property of the exit itself, not of what each
+    /// path happens to do on its way to it.
     pub(super) fn epilogue(&mut self) {
         self.epilogue_offset = self.code.len();
         self.spill_pinned();
+        self.spill_stack_pins();
         let pinned = self.pinned.clone();
         let mut pairs = pin_pairs(&pinned);
         pairs.reverse();
@@ -236,6 +292,46 @@ impl Assembler {
         self.word(0xA8C1_53F3); // ldp x19, x20, [sp], #16
         self.word(0xA8C1_7BFD); // ldp x29, x30, [sp], #16
         self.word(0xD65F_03C0); // ret
+    }
+
+    /// Reads every held stack field out of the state.
+    fn load_stack_pins(&mut self) {
+        for (register, offset, _) in stack_pins() {
+            self.load(register, offset);
+        }
+    }
+
+    /// Writes back the held stack fields generated code updates, so whatever
+    /// reads the state next — a helper, or the machine once generated code
+    /// returns — sees the length the generated code has been keeping.
+    fn spill_stack_pins(&mut self) {
+        for (register, offset, written) in stack_pins() {
+            if written {
+                self.store(register, offset);
+            }
+        }
+    }
+
+    /// The register a stack field is held in, or `scratch` once the field has
+    /// been loaded into it.
+    fn stack_field(&mut self, pin: Option<u32>, offset: usize, scratch: u32) -> u32 {
+        match pin {
+            Some(register) => register,
+            None => {
+                self.load(scratch, offset);
+                scratch
+            }
+        }
+    }
+
+    /// Commits a length computed in `source`: nothing to do when `source` is
+    /// already the register the length is held in.
+    fn set_stack_length(&mut self, pin: Option<u32>, offset: usize, source: u32) {
+        match pin {
+            Some(register) if register == source => {}
+            Some(register) => self.move_register(register, source),
+            None => self.store(source, offset),
+        }
     }
 
     /// Reloads every pinned register from its bank slot: used after a helper
@@ -256,12 +352,19 @@ impl Assembler {
         // Flush whatever the helper reads from the bank; callers reload
         // afterward if it may have written the bank.
         self.apply_spill(spill);
+        // A helper reaches the stacks through the state, so the lengths held in
+        // registers go back to memory before it runs and every held field is
+        // read again after: it may have pushed, popped, or grown a stack, and
+        // growing one moves its buffer. The reload leaves x0 alone, which is
+        // where the helper's status is waiting.
+        self.spill_stack_pins();
         self.move_register(ARGUMENTS[0], STATE);
         for (index, argument) in args.iter().enumerate() {
             self.load_immediate(ARGUMENTS[index + 1], *argument);
         }
         self.load_immediate(SCRATCH, function as u64);
         self.word(0xD63F_0000 | (SCRATCH << 5)); // blr x16
+        self.load_stack_pins();
     }
 
     pub(super) fn check_error(&mut self) {
@@ -294,28 +397,31 @@ impl Assembler {
     /// interpreter would. The fast path always transfers control, so no branch
     /// over the slow path is needed.
     ///
-    /// `length` bounds the target. It is compared as a 12-bit immediate, so a
+    /// `limit` bounds the target. It is compared as a 12-bit immediate, so a
     /// program with more ops than that keeps the helper.
     pub(super) fn return_inline(
         &mut self,
         stack: StackFields,
-        length: u32,
+        limit: u32,
         tag: u8,
         slow: impl FnOnce(&mut Self),
     ) {
+        let pins = pins_of(stack.kind);
         let mut checks = Vec::new();
-        // x1 holds the depth so x0 is free for the target the dispatch wants.
-        self.load(1, stack.length);
-        checks.push(self.forward(0xB400_0001, FixupKind::Imm19)); // cbz x1
-        self.subtract_immediate(1, 1, 1);
+        // The popped depth is built in x1, which leaves x0 free for the target
+        // the dispatch wants and keeps the held depth intact until the checks
+        // that could still send this to the helper have passed.
+        let depth = self.stack_field(pins.length, stack.length, 1);
+        checks.push(self.forward(0xB400_0000 | depth, FixupKind::Imm19)); // cbz depth
+        self.subtract_immediate(1, depth, 1);
         self.slot_address(stack, 1);
         self.load_tag(3, 2);
         self.compare_word_immediate(3, u32::from(tag));
         checks.push(self.forward(0x5400_0001, FixupKind::Imm19)); // b.ne
         self.load_from(0, 2, PAYLOAD_OFFSET);
-        self.compare_immediate(0, length);
+        self.compare_immediate(0, limit);
         checks.push(self.forward(0x5400_0002, FixupKind::Imm19)); // b.hs
-        self.store(1, stack.length);
+        self.set_stack_length(pins.length, stack.length, 1);
         self.word(0xF860_7800 | (TABLE << 5) | SCRATCH); // ldr x16, [x20, x0, lsl #3]
         self.word(0xD61F_0000 | (SCRATCH << 5)); // br x16
         for check in checks {
@@ -426,9 +532,10 @@ impl Assembler {
 
     /// Leaves `x2` pointing at the slot `index` addresses in `stack`, where
     /// `index` is a register the caller has already loaded and bounds-checked.
+    /// Held `data` folds the whole address into one instruction.
     fn slot_address(&mut self, stack: StackFields, index: u32) {
-        self.load(2, stack.data);
-        self.add_shifted(2, 2, index, VALUE_SHIFT);
+        let data = self.stack_field(pins_of(stack.kind).data, stack.data, 2);
+        self.add_shifted(2, data, index, VALUE_SHIFT);
     }
 
     /// Pushes a value onto `stack` without calling a helper: bounds-check the
@@ -441,14 +548,15 @@ impl Assembler {
         source: PushSource,
         slow: impl FnOnce(&mut Self),
     ) {
+        let pins = pins_of(stack.kind);
         let mut checks = Vec::new();
-        self.load(0, stack.length);
-        self.load(1, stack.capacity);
-        self.compare_registers(0, 1);
+        let length = self.stack_field(pins.length, stack.length, 0);
+        let capacity = self.stack_field(pins.capacity, stack.capacity, 1);
+        self.compare_registers(length, capacity);
         // b.hs — length and capacity are sizes, and length never exceeds
         // capacity, so this is taken exactly when the stack is full.
         checks.push(self.forward(0x5400_0002, FixupKind::Imm19));
-        self.slot_address(stack, 0);
+        self.slot_address(stack, length);
         match source {
             PushSource::Slot(offset) => self.load_split(3, 4, STATE, offset),
             PushSource::PinnedSlot { slot, register } => {
@@ -465,8 +573,10 @@ impl Assembler {
             }
         }
         self.store_split(3, 4, 2, 0);
-        self.add_immediate(0, 0, 1);
-        self.store(0, stack.length);
+        // Past the only check, so the length can move on: in place when it is
+        // held in a register, and through the scratch it was loaded into if not.
+        self.add_immediate(length, length, 1);
+        self.set_stack_length(pins.length, stack.length, length);
         self.slow_path(checks, slow);
     }
 
@@ -481,14 +591,16 @@ impl Assembler {
         destination: FastDest,
         slow: impl FnOnce(&mut Self),
     ) {
+        let pins = pins_of(stack.kind);
         let mut checks = Vec::new();
-        self.load(0, stack.length);
-        checks.push(self.forward(0xB400_0000, FixupKind::Imm19)); // cbz x0
-        self.subtract_immediate(0, 0, 1);
-        self.slot_address(stack, 0);
+        let length = self.stack_field(pins.length, stack.length, 0);
+        checks.push(self.forward(0xB400_0000 | length, FixupKind::Imm19)); // cbz length
+        // The empty check is the only way out, so the pop is already committed.
+        self.subtract_immediate(length, length, 1);
+        self.slot_address(stack, length);
         self.load_split(3, 4, 2, 0);
         self.store_split(3, 4, STATE, destination.slot);
-        self.store(0, stack.length);
+        self.set_stack_length(pins.length, stack.length, length);
         if let Some(register) = destination.pin {
             self.move_register(register, 4);
         }
