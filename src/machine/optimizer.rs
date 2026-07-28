@@ -108,10 +108,6 @@ impl Facts {
         }
     }
 
-    fn unknown() -> Facts {
-        Self::entry(&[])
-    }
-
     fn merge(&self, other: &Facts) -> Facts {
         let mut registers = self.registers;
         for (fact, other) in registers.iter_mut().zip(&other.registers) {
@@ -263,8 +259,8 @@ fn transfer(op: &IntermediateOp, facts: &mut Facts) {
 }
 
 /// The op indices execution may reach after `pc`: fall-through and jump
-/// targets. `Return` has no static successors; the op after every `Call` is
-/// seeded as an entry instead, since any call site may be the caller.
+/// targets. `Return` has no static successors, and a `Call` does not reach the
+/// op after it — only a return does — so [`analyze`] seeds that one itself.
 fn successors(op: &IntermediateOp, pc: usize) -> [Option<usize>; 2] {
     match *op {
         IntermediateOp::Jump(target) | IntermediateOp::Call(target) => [Some(target), None],
@@ -277,28 +273,215 @@ fn successors(op: &IntermediateOp, pc: usize) -> [Option<usize>; 2] {
     }
 }
 
+/// How many values an op takes off the value stack, and how many it puts back.
+fn stack_effect(op: &IntermediateOp) -> (usize, usize) {
+    if stack_kind(op).is_some() {
+        return (2, 1);
+    }
+    match op {
+        IntermediateOp::PushValue(_) | IntermediateOp::PushRegister(_) => (0, 1),
+        IntermediateOp::PopRegister(_) => (1, 0),
+        IntermediateOp::CountLeadingZeros
+        | IntermediateOp::CountLeadingOnes
+        | IntermediateOp::CountTrailingZeros
+        | IntermediateOp::CountTrailingOnes => (1, 1),
+        IntermediateOp::JumpIfEqual(_) => (2, 0),
+        IntermediateOp::JumpIfZero(_) => (1, 0),
+        _ => (0, 0),
+    }
+}
+
+/// Records `depth` as the frame depth on entry to `at`, reporting whether it
+/// agrees with any depth already recorded there. A target past the last op is
+/// the end of the program and constrains nothing.
+fn record(depths: &mut [Option<isize>], pending: &mut Vec<usize>, at: usize, depth: isize) -> bool {
+    match depths.get(at) {
+        None => true,
+        Some(Some(existing)) => *existing == depth,
+        Some(None) => {
+            depths[at] = Some(depth);
+            pending.push(at);
+            true
+        }
+    }
+}
+
+/// Marks `at` as reachable from inside a called frame.
+fn mark(inside: &mut [bool], pending: &mut Vec<usize>, at: usize) {
+    if let Some(flag) = inside.get_mut(at)
+        && !*flag
+    {
+        *flag = true;
+        pending.push(at);
+    }
+}
+
+/// Whether a `Call` hands the op it resumes at the very stack it was called
+/// with, which lets the analysis carry the caller's stack facts across it.
+///
+/// Depth is counted from the op a frame began at, so a `Call` target starts at
+/// zero and the op after a `Call` keeps the depth the call had. Ops are shared
+/// between frames — a tail jump re-enters a subroutine without opening one — so
+/// one depth has to fit every way an op is reached, and any disagreement gives
+/// up on the program as a whole rather than on the op.
+///
+/// Two conditions make a call transparent: every `Return` sits at the depth its
+/// frame began at, so a callee leaves the stack no shallower or deeper than it
+/// found it, and no op reaches beneath its own frame, so the values the caller
+/// left are not just still there but were never read. Ops that only the entry
+/// frame reaches are exempt from the second: a program may read values its
+/// caller pushed beyond the declared inputs, and no called frame stands on
+/// those.
+///
+/// Recursion is assumed and then discharged by the same check — every call is
+/// treated as balanced while proving that each one is — which holds by induction
+/// on the calls a run makes, the innermost of them making none.
+fn calls_are_transparent(ops: &[IntermediateOp], inputs: &[ValueType]) -> bool {
+    if ops.is_empty() {
+        return false;
+    }
+
+    let mut depths: Vec<Option<isize>> = vec![None; ops.len()];
+    depths[0] = Some(inputs.len() as isize);
+    let mut pending = vec![0usize];
+    while let Some(pc) = pending.pop() {
+        let Some(depth) = depths[pc] else { continue };
+        let op = &ops[pc];
+        if matches!(op, IntermediateOp::Return) && depth != 0 {
+            return false;
+        }
+        let (pops, pushes) = stack_effect(op);
+        let out = depth - pops as isize + pushes as isize;
+        let agrees = match *op {
+            IntermediateOp::Call(target) => {
+                record(&mut depths, &mut pending, target, 0)
+                    && record(&mut depths, &mut pending, pc + 1, out)
+            }
+            _ => successors(op, pc)
+                .into_iter()
+                .flatten()
+                .all(|successor| record(&mut depths, &mut pending, successor, out)),
+        };
+        if !agrees {
+            return false;
+        }
+    }
+
+    let mut inside = vec![false; ops.len()];
+    let mut pending = Vec::new();
+    for op in ops {
+        if let IntermediateOp::Call(target) = op {
+            mark(&mut inside, &mut pending, *target);
+        }
+    }
+    while let Some(pc) = pending.pop() {
+        let op = &ops[pc];
+        if matches!(op, IntermediateOp::Call(_)) {
+            mark(&mut inside, &mut pending, pc + 1);
+        }
+        for successor in successors(op, pc).into_iter().flatten() {
+            mark(&mut inside, &mut pending, successor);
+        }
+    }
+
+    for (pc, op) in ops.iter().enumerate() {
+        let (Some(depth), true) = (depths[pc], inside[pc]) else {
+            continue;
+        };
+        if depth < stack_effect(op).0 as isize {
+            return false;
+        }
+    }
+    true
+}
+
+/// The register bank every reached `Return` hands back, merged, or `None` while
+/// the analysis has reached no `Return` at all. `Return` leaves the bank alone,
+/// so the facts on entry to one are the facts it returns with.
+fn returned_registers(
+    ops: &[IntermediateOp],
+    entries: &[Option<Facts>],
+) -> Option<[Fact; REGISTER_BANK_COUNT]> {
+    let mut returned: Option<[Fact; REGISTER_BANK_COUNT]> = None;
+    for (pc, op) in ops.iter().enumerate() {
+        if !matches!(op, IntermediateOp::Return) {
+            continue;
+        }
+        let Some(facts) = entries[pc].as_ref() else {
+            continue;
+        };
+        returned = Some(match returned {
+            Some(mut merged) => {
+                for (fact, other) in merged.iter_mut().zip(&facts.registers) {
+                    *fact = fact.merge(*other);
+                }
+                merged
+            }
+            None => facts.registers,
+        });
+    }
+    returned
+}
+
 /// Facts on entry to every op, or `None` for ops the analysis never reached.
 /// Facts flow forward from instruction zero to a fixpoint; a jump target
 /// holds the merge of every predecessor's facts. On entry to the program the
-/// stack holds the declared input types and every register is unknown, and
-/// nothing at all is known at the op a `Return` resumes.
+/// stack holds the declared input types and every register is unknown.
+///
+/// A `Call` has no static edge to the op after it — that op is reached only by
+/// returning — so it is seeded from [`returned_registers`] instead. The bank is
+/// global and a `Return` does not touch it, so whatever bank a return resumes
+/// with is one some reached `Return` held, and merging over all of them
+/// over-approximates every one of them. Seeding it as wholly unknown, as this
+/// once did, costs more than it looks: a recursive program's registers are
+/// written before the call and read after it, so an unknown resumption point
+/// flows back around the recursion and leaves the whole body untyped, which
+/// denies the jit both its pinned registers and its proven tag checks.
+///
+/// The stack side comes from the call site rather than the returns: a
+/// resumption point belongs to exactly one `Call`, and when
+/// [`calls_are_transparent`] holds, the stack it resumes on is the one that call
+/// was made with. Without that proof it stays unknown, which is what costs the
+/// register a recursive program spills across its own call.
 fn analyze(ops: &[IntermediateOp], inputs: &[ValueType]) -> Vec<Option<Facts>> {
     let mut entries: Vec<Option<Facts>> = vec![None; ops.len()];
     let Some(first) = entries.first_mut() else {
         return entries;
     };
     *first = Some(Facts::entry(inputs));
-
-    for (pc, op) in ops.iter().enumerate() {
-        if matches!(op, IntermediateOp::Call(_))
-            && let Some(entry) = entries.get_mut(pc + 1)
-        {
-            *entry = Some(Facts::unknown());
-        }
-    }
+    let transparent = calls_are_transparent(ops, inputs);
 
     loop {
         let mut changed = false;
+
+        // Reaching a `Return` can type a resumption point, and a resumption
+        // point can lead to a `Return`, so both run inside the fixpoint.
+        if let Some(registers) = returned_registers(ops, &entries) {
+            for (pc, op) in ops.iter().enumerate() {
+                if !matches!(op, IntermediateOp::Call(_)) {
+                    continue;
+                }
+                // `Call` leaves the stack alone, so the facts on entry to it are
+                // the ones it hands on.
+                let stack = match (transparent, entries[pc].as_ref()) {
+                    (true, Some(facts)) => facts.stack.clone(),
+                    _ => Vec::new(),
+                };
+                let resumed = Facts { registers, stack };
+                let Some(entry) = entries.get_mut(pc + 1) else {
+                    continue;
+                };
+                let merged = match entry.as_ref() {
+                    Some(existing) => existing.merge(&resumed),
+                    None => resumed,
+                };
+                if entry.as_ref() != Some(&merged) {
+                    *entry = Some(merged);
+                    changed = true;
+                }
+            }
+        }
+
         for (pc, op) in ops.iter().enumerate() {
             let Some(facts) = entries[pc].as_ref() else {
                 continue;
