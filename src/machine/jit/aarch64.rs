@@ -339,7 +339,7 @@ impl Assembler {
                 pin: Some(register),
                 ..
             } => register,
-            FastOperand::Trusted { slot, pin: None } => {
+            FastOperand::Trusted { slot, pin: _ } => {
                 self.load(scratch, slot + PAYLOAD_OFFSET);
                 scratch
             }
