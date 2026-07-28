@@ -24,6 +24,7 @@ pub mod ops;
 pub mod optimizer;
 pub mod registers;
 pub mod stack;
+pub mod trace;
 pub mod value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

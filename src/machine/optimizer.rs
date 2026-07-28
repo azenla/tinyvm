@@ -1,5 +1,6 @@
 use crate::machine::intermediate::{BinaryOpKind, IntermediateOp, IntermediateProgram, Source};
 use crate::machine::registers::REGISTER_BANK_COUNT;
+use crate::machine::trace::Rewrites;
 use crate::machine::value::MachineValue;
 
 /// The type of a value as far as static analysis can prove it.
@@ -395,19 +396,27 @@ fn fold(op: IntermediateOp, pc: usize) -> IntermediateOp {
 /// hold, then folds ops whose operands all became constant: arithmetic into
 /// copies of the result, and conditional jumps into unconditional jumps —
 /// to the target when the condition holds, to the next op when it cannot.
-fn rewrite(ops: &mut [IntermediateOp], entries: &[Option<Facts>]) {
+/// Records against every op which of the two changed it, so a later stage can
+/// say why an op no longer looks like what was written.
+fn rewrite(ops: &mut [IntermediateOp], entries: &[Option<Facts>], rewrites: &mut [Rewrites]) {
     for pc in 0..ops.len() {
-        let Some(facts) = &entries[pc] else { continue };
-        let mut op = ops[pc];
+        let Some(facts) = &entries[pc] else {
+            rewrites[pc].unreached = true;
+            continue;
+        };
+        let original = ops[pc];
+        let mut op = original;
         substitute(&mut op, facts);
+        rewrites[pc].substituted = op != original;
         ops[pc] = fold(op, pc);
+        rewrites[pc].folded = ops[pc] != op;
     }
 }
 
 /// Sends jumps whose destination is itself an unconditional jump straight to
 /// the final destination. Chains are followed a bounded number of steps so a
 /// cycle of jumps — an intentional infinite loop — terminates.
-fn thread(ops: &mut [IntermediateOp]) {
+fn thread(ops: &mut [IntermediateOp], rewrites: &mut [Rewrites]) {
     let follow = |start: usize| {
         let mut target = start;
         for _ in 0..ops.len() {
@@ -419,16 +428,20 @@ fn thread(ops: &mut [IntermediateOp]) {
         target
     };
     let resolved: Vec<usize> = (0..ops.len()).map(follow).collect();
-    for op in ops.iter_mut() {
+    for (pc, op) in ops.iter_mut().enumerate() {
+        let original = *op;
         op.remap(|target| resolved.get(target).copied().unwrap_or(target));
+        rewrites[pc].threaded = *op != original;
     }
 }
 
 /// Drops jumps to the immediately following op — left behind by folded
-/// conditions — and remaps every target into the shortened program.
-fn compact(ops: Vec<IntermediateOp>) -> Vec<IntermediateOp> {
+/// conditions — and remaps every target into the shortened program. Returns
+/// the surviving ops and, for each one, the index it held on the way in.
+fn compact(ops: Vec<IntermediateOp>) -> (Vec<IntermediateOp>, Vec<usize>) {
     let mut map = Vec::with_capacity(ops.len());
     let mut compacted = Vec::with_capacity(ops.len());
+    let mut origins = Vec::with_capacity(ops.len());
     for (pc, op) in ops.iter().enumerate() {
         map.push(compacted.len());
         if let IntermediateOp::Jump(target) = op
@@ -437,6 +450,7 @@ fn compact(ops: Vec<IntermediateOp>) -> Vec<IntermediateOp> {
             continue;
         }
         compacted.push(*op);
+        origins.push(pc);
     }
 
     let length = compacted.len();
@@ -449,7 +463,7 @@ fn compact(ops: Vec<IntermediateOp>) -> Vec<IntermediateOp> {
             }
         });
     }
-    compacted
+    (compacted, origins)
 }
 
 /// An intermediate program rewritten by constant propagation and folding,
@@ -462,6 +476,9 @@ pub struct OptimizedProgram {
     ops: Vec<IntermediateOp>,
     types: Vec<RegisterTypes>,
     inputs: Vec<ValueType>,
+    origins: Vec<usize>,
+    rewrites: Vec<Rewrites>,
+    destinations: Vec<Option<usize>>,
 }
 
 impl OptimizedProgram {
@@ -475,10 +492,19 @@ impl OptimizedProgram {
     /// the actual stack whenever execution enters at instruction zero.
     pub fn compile_with_inputs(program: &IntermediateProgram, inputs: &[ValueType]) -> Self {
         let mut ops = program.ops().to_vec();
+        let mut rewrites = vec![Rewrites::default(); ops.len()];
         let entries = analyze(&ops, inputs);
-        rewrite(&mut ops, &entries);
-        thread(&mut ops);
-        let ops = compact(ops);
+        rewrite(&mut ops, &entries, &mut rewrites);
+        thread(&mut ops, &mut rewrites);
+        let (ops, origins) = compact(ops);
+
+        // Rewrites are recorded against the incoming indices and stay there;
+        // what every incoming op needs on top of them is where it landed, or
+        // that compaction dropped it.
+        let mut destinations = vec![None; rewrites.len()];
+        for (index, origin) in origins.iter().enumerate() {
+            destinations[*origin] = Some(index);
+        }
 
         // The analysis runs again over the final ops so the recorded types
         // line up with the compacted indices.
@@ -491,6 +517,9 @@ impl OptimizedProgram {
             ops,
             types,
             inputs: inputs.to_vec(),
+            origins,
+            rewrites,
+            destinations,
         }
     }
 
@@ -506,5 +535,25 @@ impl OptimizedProgram {
     /// The declared types of the entry stack, deepest first.
     pub fn inputs(&self) -> &[ValueType] {
         &self.inputs
+    }
+
+    /// The intermediate op every op came from, parallel to `ops`. Rewriting is
+    /// one-for-one, so an op's origin differs from its own index only by
+    /// however many ops before it compaction dropped.
+    pub fn origins(&self) -> &[usize] {
+        &self.origins
+    }
+
+    /// What the optimizer did to every intermediate op, parallel to the
+    /// intermediate program's ops rather than to `ops`, so the record survives
+    /// for ops that were dropped.
+    pub fn rewrites(&self) -> &[Rewrites] {
+        &self.rewrites
+    }
+
+    /// Where every intermediate op landed, parallel to the intermediate
+    /// program's ops: its index in `ops`, or `None` if it was dropped.
+    pub fn destinations(&self) -> &[Option<usize>] {
+        &self.destinations
     }
 }

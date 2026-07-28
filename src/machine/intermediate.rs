@@ -1,6 +1,7 @@
 use crate::machine::MachineState;
 use crate::machine::error::{MachineError, Result};
 use crate::machine::registers::RegisterBank;
+use crate::machine::trace::Span;
 use crate::machine::value::MachineValue;
 use crate::op::{Op, OpArg, OpCode};
 use crate::program::RawProgram;
@@ -360,6 +361,8 @@ fn instruction_target(op: &Op) -> Result<usize> {
 #[derive(Clone, Debug)]
 pub struct IntermediateProgram {
     ops: Vec<IntermediateOp>,
+    origins: Vec<Span>,
+    destinations: Vec<usize>,
 }
 
 impl IntermediateProgram {
@@ -382,6 +385,7 @@ impl IntermediateProgram {
         }
 
         let mut ops = Vec::with_capacity(source.len());
+        let mut origins = Vec::with_capacity(source.len());
         let mut map = vec![0; source.len()];
         let mut index = 0;
         while index < source.len() {
@@ -393,6 +397,7 @@ impl IntermediateProgram {
                 map[index + offset] = ops.len();
             }
             ops.push(op);
+            origins.push(Span::new(index, index + length));
             index += length;
         }
 
@@ -407,10 +412,28 @@ impl IntermediateProgram {
             });
         }
 
-        Ok(Self { ops })
+        Ok(Self {
+            ops,
+            origins,
+            destinations: map,
+        })
     }
 
     pub fn ops(&self) -> &[IntermediateOp] {
         &self.ops
+    }
+
+    /// The raw ops fused into every op, parallel to `ops`. A superinstruction
+    /// spans the whole sequence it replaced; every other op spans the single
+    /// raw op it compiled from.
+    pub fn origins(&self) -> &[Span] {
+        &self.origins
+    }
+
+    /// The op every raw op became part of, parallel to the raw program's ops.
+    /// Each op of a fused sequence maps to the superinstruction that swallowed
+    /// it, so several raw ops may share one entry.
+    pub fn destinations(&self) -> &[usize] {
+        &self.destinations
     }
 }

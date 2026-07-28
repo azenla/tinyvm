@@ -4,6 +4,7 @@ use crate::machine::intermediate::{BinaryOpKind, IntermediateOp, IntermediatePro
 use crate::machine::optimizer::{OptimizedProgram, RegisterTypes, ValueType};
 use crate::machine::registers::{REGISTER_BANK_COUNT, RegisterBank};
 use crate::machine::stack::ValueStack;
+use crate::machine::trace::{Lowering, Span};
 use crate::machine::value::MachineValue;
 use std::sync::Arc;
 
@@ -200,6 +201,21 @@ fn dest(index: usize, pins: &[Option<u32>]) -> FastDest {
     }
 }
 
+/// The lowering of an inlined fast path, which is decided by its operands: an
+/// operand of unproven type has its tag checked at run time, and a failed check
+/// is what the out-of-line helper is there to catch. With every operand proven
+/// no check is emitted, so nothing but straight-line code is left.
+fn fast_lowering(operands: &[FastOperand]) -> Lowering {
+    if operands
+        .iter()
+        .any(|operand| matches!(operand, FastOperand::Checked { .. }))
+    {
+        Lowering::Fast
+    } else {
+        Lowering::Inline
+    }
+}
+
 /// Assigns pinned CPU registers to the most-used VM registers the analysis
 /// proves stay `Uint64`. A register is eligible when its inferred type is
 /// `Uint64` or `Unknown` at every op (never another concrete type), it is
@@ -348,6 +364,16 @@ struct JitCode {
     inputs: Box<[ValueType]>,
     /// Operand pool referenced by pointers embedded in the generated code.
     _ops: Box<[IntermediateOp]>,
+    /// The byte range of every op's code, indexed by instruction. Ops are
+    /// emitted in order, so the ranges are ascending and contiguous.
+    spans: Box<[Span]>,
+    /// How every op was lowered, as decided while it was emitted.
+    lowerings: Box<[Lowering]>,
+    /// The code before the first op, which enters generated code.
+    prologue: Span,
+    /// The code after the last op: the instruction-overflow stub and the
+    /// epilogue that leaves generated code.
+    epilogue: Span,
 }
 
 impl JitProgram {
@@ -384,10 +410,11 @@ impl JitProgram {
         assembler.prologue();
 
         let mut offsets = Vec::with_capacity(ops.len());
+        let mut lowerings = Vec::with_capacity(ops.len());
         for (pc, op) in ops.iter().enumerate() {
             offsets.push(assembler.offset());
             let op_types = types.get(pc).copied().unwrap_or_default();
-            emit(&mut assembler, op, pc, ops.len(), &op_types, &pins);
+            lowerings.push(emit(&mut assembler, op, pc, ops.len(), &op_types, &pins));
         }
 
         let overflow = assembler.offset();
@@ -399,7 +426,18 @@ impl JitProgram {
         assembler.epilogue();
         assembler.patch(&offsets, overflow)?;
 
-        let memory = platform::ExecutableMemory::new(&assembler.finish())?;
+        // Every op's code runs from where it started to wherever the next one
+        // did, the last one ending where the overflow stub begins.
+        let spans: Box<[Span]> = offsets
+            .iter()
+            .enumerate()
+            .map(|(pc, start)| Span::new(*start, offsets.get(pc + 1).copied().unwrap_or(overflow)))
+            .collect();
+        let prologue = Span::new(0, offsets.first().copied().unwrap_or(overflow));
+
+        let code = assembler.finish();
+        let epilogue = Span::new(overflow, code.len());
+        let memory = platform::ExecutableMemory::new(&code)?;
         let base = memory.as_ptr() as usize;
         for (entry, offset) in entries.iter_mut().zip(&offsets) {
             *entry = base + offset;
@@ -411,8 +449,60 @@ impl JitProgram {
                 entries,
                 inputs: inputs.into(),
                 _ops: ops,
+                spans,
+                lowerings: lowerings.into(),
+                prologue,
+                epilogue,
             }),
         })
+    }
+
+    /// The byte range of every op's code within [`code`](JitProgram::code),
+    /// indexed the same way as the ops the program was compiled from.
+    pub fn spans(&self) -> &[Span] {
+        &self.code.spans
+    }
+
+    /// How the jit lowered every op, indexed the same way as the ops the
+    /// program was compiled from.
+    pub fn lowerings(&self) -> &[Lowering] {
+        &self.code.lowerings
+    }
+
+    /// The generated machine code.
+    pub fn code(&self) -> &[u8] {
+        self.code.memory.as_slice()
+    }
+
+    /// The prologue, which runs before the op that execution enters at.
+    pub fn prologue(&self) -> Span {
+        self.code.prologue
+    }
+
+    /// The instruction-overflow stub and the epilogue, which run after the
+    /// program's own code.
+    pub fn epilogue(&self) -> Span {
+        self.code.epilogue
+    }
+
+    /// The address generated code branches to in order to run one op.
+    pub fn address(&self, pc: usize) -> Option<usize> {
+        self.code.entries.get(pc).copied()
+    }
+
+    /// The op whose code covers a native address, which reads an address
+    /// observed at run time — a native program counter, a profiler's sample —
+    /// back into a program counter. `None` for an address in the prologue or
+    /// epilogue, or outside the generated code altogether.
+    pub fn op_at(&self, address: usize) -> Option<usize> {
+        let offset = address.checked_sub(self.code.memory.as_ptr() as usize)?;
+        // Ops are emitted in order, so the first span starting after the offset
+        // bounds the search: the op before it is the only candidate. An op that
+        // emitted no code at all has an empty span, which contains nothing and
+        // never wins over the op sharing its start.
+        let following = self.code.spans.partition_point(|span| span.start <= offset);
+        let pc = following.checked_sub(1)?;
+        self.code.spans[pc].contains(offset).then_some(pc)
     }
 
     pub(crate) fn run(&self, state: &mut MachineState) -> Result<()> {
@@ -430,6 +520,8 @@ impl JitProgram {
     }
 }
 
+/// Emits one op's code and reports how it was lowered, so what the jit decided
+/// here can be correlated with the op it decided it for.
 fn emit(
     assembler: &mut Assembler,
     op: &IntermediateOp,
@@ -437,7 +529,7 @@ fn emit(
     length: usize,
     types: &RegisterTypes,
     pins: &[Option<u32>],
-) {
+) -> Lowering {
     let data = op as *const IntermediateOp as u64;
     let position = pc as u64;
     match op {
@@ -448,6 +540,9 @@ fn emit(
             assembler.push_inline(value_stack(), PushSource::Constant(address), |assembler| {
                 assembler.call(helper::push_value as *const (), &[data], Spill::None);
             });
+            // The inlined push keeps a helper for the one case it cannot
+            // handle: growing a stack that is already full.
+            Lowering::Fast
         }
         IntermediateOp::PushRegister(index) => {
             // The pushed value is the whole slot, tag included, but a pinned
@@ -465,6 +560,7 @@ fn emit(
             assembler.push_inline(value_stack(), source, |assembler| {
                 assembler.call(helper::push_register as *const (), &[data], spill);
             });
+            Lowering::Fast
         }
         IntermediateOp::PopRegister(index) => {
             let destination = dest(*index, pins);
@@ -485,7 +581,10 @@ fn emit(
                     assembler.reload_one(register, destination.slot);
                 }
             });
+            Lowering::Fast
         }
+        // Arithmetic and conditions that never got fused still take their
+        // operands off the value stack, which only the helpers do.
         IntermediateOp::Add
         | IntermediateOp::Subtract
         | IntermediateOp::Multiply
@@ -497,6 +596,7 @@ fn emit(
                 Spill::None,
             );
             assembler.check_error();
+            Lowering::Helper
         }
         IntermediateOp::CountLeadingZeros
         | IntermediateOp::CountLeadingOnes
@@ -508,6 +608,7 @@ fn emit(
                 Spill::None,
             );
             assembler.check_error();
+            Lowering::Helper
         }
         IntermediateOp::JumpIfEqual(target) => {
             assembler.call(
@@ -516,6 +617,7 @@ fn emit(
                 Spill::None,
             );
             assembler.branch_status(*target);
+            Lowering::Helper
         }
         IntermediateOp::JumpIfZero(target) => {
             assembler.call(
@@ -524,9 +626,11 @@ fn emit(
                 Spill::None,
             );
             assembler.branch_status(*target);
+            Lowering::Helper
         }
         IntermediateOp::Jump(target) => {
             assembler.jump(*target);
+            Lowering::Inline
         }
         IntermediateOp::Call(target) => {
             // Touches only the call stack, pushing a return address the two
@@ -546,6 +650,7 @@ fn emit(
                 );
             });
             assembler.jump(*target);
+            Lowering::Fast
         }
         IntermediateOp::Return => {
             let slow = |assembler: &mut Assembler| {
@@ -561,8 +666,12 @@ fn emit(
             match u32::try_from(length) {
                 Ok(length) if length <= 0xFFF => {
                     assembler.return_inline(call_stack(), length, return_address_tag(), slow);
+                    Lowering::Fast
                 }
-                _ => slow(assembler),
+                _ => {
+                    slow(assembler);
+                    Lowering::Helper
+                }
             }
         }
         IntermediateOp::Exit => {
@@ -570,6 +679,7 @@ fn emit(
             // coherent on the way out.
             assembler.call(helper::finish as *const (), &[position], Spill::None);
             assembler.jump_epilogue();
+            Lowering::Helper
         }
         IntermediateOp::Binary {
             kind,
@@ -604,6 +714,7 @@ fn emit(
                         op: data,
                         write_tag,
                     });
+                    fast_lowering(&[lhs, rhs])
                 }
                 // Divide and remainder have no fast path, and an operand that is
                 // not a `Uint64` immediate cannot be materialized inline. The
@@ -616,6 +727,7 @@ fn emit(
                     if let Some(register) = pin_of(*dst, pins) {
                         assembler.reload_one(register, slot(*dst));
                     }
+                    Lowering::Helper
                 }
             }
         }
@@ -631,18 +743,22 @@ fn emit(
                 Source::Register(index) if types.get(*index) == ValueType::Uint64 => {
                     let source = register_operand(*index, types, pins);
                     assembler.copy_register(source, destination, write_tag);
+                    Lowering::Inline
                 }
                 Source::Value(MachineValue::Uint64(value)) => {
                     assembler.copy_register(FastOperand::Immediate(*value), destination, write_tag);
+                    Lowering::Inline
                 }
                 // Any other source may not be a `Uint64`, so the whole slot is
                 // copied through memory; a pinned destination is refreshed
-                // from the slot afterward.
+                // from the slot afterward. Still no call: a tagged copy needs
+                // no more than a pair of loads and stores.
                 Source::Register(index) => {
                     assembler.copy_slot(slot(*index), destination.slot);
                     if let Some(register) = destination.pin {
                         assembler.reload_one(register, destination.slot);
                     }
+                    Lowering::Inline
                 }
                 Source::Value(value) => {
                     assembler
@@ -650,14 +766,19 @@ fn emit(
                     if let Some(register) = destination.pin {
                         assembler.reload_one(register, destination.slot);
                     }
+                    Lowering::Inline
                 }
             }
         }
         IntermediateOp::JumpIfEqualValues { lhs, rhs, target } => {
             if let (Source::Value(lhs), Source::Value(rhs)) = (lhs, rhs) {
+                // Constants the optimizer left behind: the comparison is
+                // settled here, so all that is emitted is the jump it decides,
+                // or nothing at all when the condition cannot hold.
                 if rhs == lhs {
                     assembler.jump(*target);
                 }
+                Lowering::Inline
             } else if let (Some(lhs), Some(rhs)) = (
                 fast_operand(lhs, types, pins),
                 fast_operand(rhs, types, pins),
@@ -669,6 +790,7 @@ fn emit(
                     helper::jump_if_equal_values as *const (),
                     data,
                 );
+                fast_lowering(&[lhs, rhs])
             } else {
                 // Resolves both operands from the bank.
                 assembler.call(
@@ -677,19 +799,25 @@ fn emit(
                     Spill::All,
                 );
                 assembler.branch_taken(*target);
+                Lowering::Helper
             }
         }
         IntermediateOp::JumpIfZeroValue { src, target } => match src {
-            Source::Register(index) => assembler.jump_if_zero_fast(
-                register_operand(*index, types, pins),
-                *target,
-                helper::jump_if_zero_values as *const (),
-                data,
-            ),
+            Source::Register(index) => {
+                let source = register_operand(*index, types, pins);
+                assembler.jump_if_zero_fast(
+                    source,
+                    *target,
+                    helper::jump_if_zero_values as *const (),
+                    data,
+                );
+                fast_lowering(&[source])
+            }
             Source::Value(value) => {
                 if value.is_zero() {
                     assembler.jump(*target);
                 }
+                Lowering::Inline
             }
         },
     }

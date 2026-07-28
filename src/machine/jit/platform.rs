@@ -26,6 +26,12 @@ impl ExecutableMemory {
     pub(super) fn as_ptr(&self) -> *const u8 {
         self.ptr
     }
+
+    /// The generated code as bytes. Nothing writes to the mapping after
+    /// construction, so handing out a shared slice of it is sound.
+    pub(super) fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.length) }
+    }
 }
 
 impl Drop for ExecutableMemory {
