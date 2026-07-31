@@ -43,7 +43,9 @@ fn main() {
     ))]
     tiers.push((
         "jit",
-        MachineProgram::Jit(tinyvm::machine::jit::JitProgram::compile_optimized(&optimized).unwrap()),
+        MachineProgram::Jit(
+            tinyvm::machine::jit::JitProgram::compile_optimized(&optimized).unwrap(),
+        ),
     ));
 
     let mut results = Vec::new();

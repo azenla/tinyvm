@@ -1,6 +1,9 @@
 use std::path::Path;
 use std::str::FromStr;
 use tinyvm::machine::error::Result;
+use tinyvm::machine::intermediate::IntermediateProgram;
+use tinyvm::machine::jit::JitProgram;
+use tinyvm::machine::optimizer::{OptimizedProgram, ValueType};
 use tinyvm::machine::value::MachineValue;
 use tinyvm::machine::{Machine, MachineProgram, ops};
 use tinyvm::op::OpArg;
@@ -19,17 +22,42 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let content = std::fs::read_to_string(path).unwrap();
-    let program = RawProgram::from_str(&content).unwrap();
-    let ops = ops::all();
-    let inlined = ops.inline(&program)?;
-    let program = MachineProgram::Inlined(inlined);
-    let mut machine = Machine::new(ops);
+    let mut inputs = Vec::new();
 
     for arg in args.iter().skip(2) {
         let argument = OpArg::from_str(arg).unwrap();
         let value: MachineValue = argument.into();
-        machine.state().push(value);
+        inputs.push(value);
+    }
+
+    let content = std::fs::read_to_string(path).unwrap();
+    let program = RawProgram::from_str(&content).unwrap();
+    let ops = ops::all();
+    let intermediate = IntermediateProgram::compile(&program)?;
+    let optimized = OptimizedProgram::compile_with_inputs(
+        &intermediate,
+        &inputs.iter().map(ValueType::of).collect::<Vec<_>>(),
+    );
+
+    #[cfg(all(
+        any(unix, windows),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let program = {
+        let jit = JitProgram::compile_optimized(&optimized)?;
+        MachineProgram::Jit(jit)
+    };
+
+    #[cfg(not(all(
+        any(unix, windows),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    let program = MachineProgram::Optimized(optimized);
+
+    let mut machine = Machine::new(ops);
+
+    for input in inputs {
+        machine.state().push(input);
     }
 
     machine.run(&program)?;

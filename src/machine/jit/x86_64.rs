@@ -1,6 +1,6 @@
 use super::{
-    FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, PushSource, Spill, StackFields,
-    StackKind,
+    FastBinary, FastBinaryOp, FastDest, FastOperand, PAYLOAD_OFFSET, PushSource, Spill,
+    StackFields, StackKind,
 };
 use crate::machine::error::{MachineError, Result};
 
