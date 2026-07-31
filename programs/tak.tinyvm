@@ -1,0 +1,113 @@
+# Takeuchi's function, in the form used by the Gabriel benchmarks:
+#
+#   tak(x, y, z) = z                                         if y >= x
+#   tak(x, y, z) = tak(tak(x - 1, y, z),
+#                      tak(y - 1, z, x),
+#                      tak(z - 1, x, y))                     if y < x
+#
+# Inputs are read from the stack as (x, y, z) with z on top, and the single
+# result is left on the stack.
+#
+# Calling convention: `tak` takes x, y, z in r1, r2, r3 and leaves its result
+# in r9; r4 through r8 are scratch. Every register is global, so all three
+# arguments have to survive three nested calls that each clobber them. They are
+# spilled to the value stack as a group and reloaded after each call -- a
+# recursive program has to invent this for itself, and unlike ack.tinyvm (which
+# keeps one value alive across one call) this one keeps three alive across
+# three, which is what makes it worth having.
+#
+# The results accumulate on the value stack underneath the spilled arguments,
+# so the frame grows and shrinks in a fixed pattern: the depth at every `ret`
+# is the depth the frame was entered at, which is the property the optimizer's
+# `calls_are_transparent` check needs in order to carry stack facts across a
+# call at all.
+#
+# There is no comparison op, so `y < x` is computed as clz(y - x) == 0: the
+# subtraction wraps past 2^63 exactly when y < x, setting the top bit, and the
+# leading-zero count is zero only then. Equality lands on clz == 64, correctly
+# reading as "not less". This costs two helper calls per activation (the count
+# and the unfused `jiz`), and is where tak pays for having no `lt` op.
+#
+# Only the innermost of the four calls is a real call; the outer application is
+# a tail jump, so call-stack depth tracks the recursion's own depth.
+
+# --- main ---
+pop r3
+pop r2
+pop r1
+call 6p
+push r9
+exit
+
+# --- tak (instruction 6) ---
+# r7 = y - x; the top bit is set exactly when y < x.
+push r2
+push r1
+sub
+pop r7
+push r7
+clz
+jiz 16p
+# y >= x: the result is z.
+push r3
+pop r9
+ret
+
+# --- recurse (instruction 16) ---
+# Spill (x, y, z); the first call clobbers all three.
+push r1
+push r2
+push r3
+# tak(x - 1, y, z): r2 and r3 already hold y and z.
+push r1
+push 1u64
+sub
+pop r1
+call 6p
+# Reload the arguments and stack the first result underneath a fresh spill.
+pop r3
+pop r2
+pop r1
+push r9
+push r1
+push r2
+push r3
+# tak(y - 1, z, x): rotate through r4, since r1 is overwritten first.
+push r1
+pop r4
+push r2
+push 1u64
+sub
+pop r1
+push r3
+pop r2
+push r4
+pop r3
+call 6p
+# Reload again; the value stack now holds both results.
+pop r3
+pop r2
+pop r1
+push r9
+# tak(z - 1, x, y): x and y both have to outlive their own overwrites.
+push r1
+pop r4
+push r2
+pop r5
+push r3
+push 1u64
+sub
+pop r1
+push r4
+pop r2
+push r5
+pop r3
+call 6p
+# The three results are (a, b) on the stack and c in r9, which is exactly the
+# argument order the outer application wants. Reclaiming them returns the frame
+# to the depth it was entered at, so the tail jump's eventual `ret` balances.
+pop r2
+pop r1
+push r9
+pop r3
+jmp 6p

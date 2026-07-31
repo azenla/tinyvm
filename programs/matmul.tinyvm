@@ -1,0 +1,105 @@
+# Multiplication of two n x n matrices whose entries are given by a formula
+# rather than stored, since the machine has no addressable memory:
+#
+#   A[i][k] = i * k + 1
+#   B[k][j] = k * j + 2
+#   C[i][j] = sum over k of A[i][k] * B[k][j]
+#
+# The single result is the sum of every entry of C. Indices run from n down to
+# 1 rather than 0 up to n - 1, because `jiz` on the counter is the only loop
+# test available and it wants the counter to reach zero.
+#
+# Input is n on the stack; the checksum is left on the stack. Everything is
+# u64 and wraps, so the checksum is well defined for any n.
+#
+# This is the pipeline's best case, and exists to measure it: there is no
+# division, no remainder, no call, and every arithmetic expression is written
+# as push/push/op/pop so fusion collapses it into one register-to-register
+# `Binary`. Nothing here needs the value stack's contents, so nothing needs a
+# helper, and the accumulators stay `Uint64` throughout so the register
+# allocator can pin them.
+
+# Unpack n and clear the checksum.
+pop r1
+push 0u64
+pop r6
+
+# i = n
+push r1
+pop r2
+
+# --- i_loop (instruction 5) ---
+push r2
+jiz 60p
+# j = n
+push r1
+pop r3
+
+# --- j_loop (instruction 9) ---
+push r3
+jiz 55p
+# The accumulator for C[i][j], and k = n.
+push 0u64
+pop r5
+push r1
+pop r4
+
+# --- k_loop (instruction 15) ---
+push r4
+jiz 46p
+# r7 = A[i][k] = i * k + 1
+push r2
+push r4
+mul
+pop r7
+push r7
+push 1u64
+add
+pop r7
+# r8 = B[k][j] = k * j + 2
+push r4
+push r3
+mul
+pop r8
+push r8
+push 2u64
+add
+pop r8
+# acc += A[i][k] * B[k][j]
+push r7
+push r8
+mul
+pop r7
+push r5
+push r7
+add
+pop r5
+# k -= 1
+push r4
+push 1u64
+sub
+pop r4
+jmp 15p
+
+# --- j_next (instruction 46) ---
+# C[i][j] is finished: fold it into the checksum and step j.
+push r6
+push r5
+add
+pop r6
+push r3
+push 1u64
+sub
+pop r3
+jmp 9p
+
+# --- i_next (instruction 55) ---
+push r2
+push 1u64
+sub
+pop r2
+jmp 5p
+
+# --- done (instruction 60) ---
+push r6
+exit

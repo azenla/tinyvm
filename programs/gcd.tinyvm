@@ -1,0 +1,84 @@
+# Euclid's algorithm, run over n pairs and summed:
+#
+#   for i = n down to 1:  sum += gcd(i * 1103515245 + 12345, i)
+#
+# The multiplier is the ANSI C `rand` constant, used only to give each pair a
+# large, varied first operand so the trajectories differ in length.
+#
+# Input is n on the stack; the sum is left on the stack. Both accumulate with
+# wrapping u64 arithmetic.
+#
+# This is the deliberate counterpart to matmul.tinyvm: the jit gives divide and
+# remainder no inlined fast path, because a zero divisor has to reach the
+# interpreter's own division rather than trap in native code, so a loop whose
+# body is one `rem` lowers almost entirely to helper calls. Nothing else here
+# competes for execution count, which is the point -- it measures the helper
+# share's ceiling the same way matmul measures its floor.
+#
+# The inner loop tests b for zero before dividing by it, so no divisor is ever
+# zero; division by zero panics rather than raising a machine error.
+
+pop r1
+push 0u64
+pop r6
+
+# i = n
+push r1
+pop r2
+
+# --- outer (instruction 5) ---
+push r2
+jiz 41p
+# a = i * 1103515245 + 12345
+push r2
+push 1103515245u64
+mul
+pop r3
+push r3
+push 12345u64
+add
+pop r3
+# b = i
+push r2
+pop r4
+
+# --- inner (instruction 17) ---
+# Reducing each operand into itself in turn, rather than rotating the pair
+# through a temporary, is what makes this loop worth measuring: the obvious
+# form spends three of its five ops moving values between registers, which the
+# jit inlines, and those crowd out the one op that actually costs something.
+# Here the loop is two tests, two remainders and a jump, so two ops in five are
+# helper calls and the measurement is of division and almost nothing else.
+push r4
+jiz 32p
+push r3
+push r4
+rem
+pop r3
+push r3
+jiz 30p
+push r4
+push r3
+rem
+pop r4
+jmp 17p
+
+# --- gcd_in_b (instruction 30) ---
+# a divided out first, so b holds the gcd.
+push r4
+pop r3
+
+# --- gcd_in_a (instruction 32) ---
+push r6
+push r3
+add
+pop r6
+push r2
+push 1u64
+sub
+pop r2
+jmp 5p
+
+# --- done (instruction 41) ---
+push r6
+exit

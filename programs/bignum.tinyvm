@@ -1,0 +1,372 @@
+# 192-bit multiprecision arithmetic: the product of the first n odd numbers
+# past one, reduced to the decimal digit sum of the result.
+#
+#   P = 3 * 5 * 7 * ... * (2n + 1)   modulo 2^192
+#   result = sum of the decimal digits of P
+#
+# Input is n on the stack; the digit sum is left on the stack.
+#
+# P is held as six limbs of 32 bits in r1 through r6, least significant first,
+# and r7/r8/r9 are the only scratch there is. Two passes operate on it in
+# place, both fully unrolled because the limb count is fixed:
+#
+#   mul_small   multiplies P by a value below 2^32, least significant limb
+#               first, so the carry flows the way carries flow. The final
+#               carry is dropped, which is what makes the arithmetic wrap at
+#               192 bits rather than overflow.
+#   div10       divides P by ten, most significant limb first, so the running
+#               remainder flows the way remainders flow, and leaves the low
+#               decimal digit of the old P in r7.
+#
+# Why the odd numbers rather than n!: every factor is odd, so P stays odd, so
+# it never becomes zero. A wrapping factorial would collect 192 factors of two
+# somewhere around n = 200 and be identically zero from there on, which makes
+# every larger input compute the same nothing.
+#
+# The multiplier is 2k + 1 and each limb is under 2^32, so limb * m + carry
+# stays under 2^64 and never overflows a machine word -- as long as n is under
+# 2^31, which every useful input is.
+#
+# This is the program that leans on the parts of the pipeline the others do
+# not. Both passes are almost entirely divide and remainder, which have no
+# inlined fast path, so it sits near gcd.tinyvm's helper share while doing
+# real work. All nine registers are live at once, which is the case the
+# register allocator has to ration rather than simply satisfy. And the loop
+# state cannot live in a register, because the limbs have taken them all, so
+# it lives in a fixed frame on the value stack that is reloaded around every
+# call -- which is exactly the pattern that needs the optimizer to carry stack
+# facts across a call in order to know the frame still holds u64s.
+#
+# There is no unbounded version of this program. Mapping a pass over a limb
+# array held on the value stack is impossible: the pass consumes the top limb
+# and the output it pushes buries the next input, so the outputs it has
+# produced so far must all be held somewhere, and the only somewhere is nine
+# registers. A fixed limb count sidesteps that by keeping the whole number in
+# registers and unrolling.
+
+# --- main ---
+pop r9
+
+# P = 1
+push 1u64
+pop r1
+push 0u64
+pop r2
+push 0u64
+pop r3
+push 0u64
+pop r4
+push 0u64
+pop r5
+push 0u64
+pop r6
+
+# Loop state, as a frame of (n, k) with k on top. Nothing else is free to hold
+# it: r1 through r6 are the number and r7 through r9 are the passes' scratch.
+push r9
+push 1u64
+
+# --- k_loop (instruction 15) ---
+# Reload the frame. Popping both and pushing both back leaves it exactly as it
+# was, which is the only reason a value stack with no indexing can serve as one.
+pop r7
+pop r9
+push r9
+push r7
+# Stop once k has passed n. There is no comparison op, so n < k is computed as
+# clz(n - k) == 0: the subtraction wraps past 2^63 exactly when n < k.
+push r9
+push r7
+sub
+pop r8
+push r8
+clz
+jiz 44p
+# m = 2k + 1
+push r7
+push r7
+add
+pop r8
+push r8
+push 1u64
+add
+pop r8
+call 78p
+# k += 1
+pop r7
+pop r9
+push r7
+push 1u64
+add
+pop r7
+push r9
+push r7
+jmp 15p
+
+# --- digits (instruction 44) ---
+# Discard the multiply loop's frame and start the digit sum's.
+pop r7
+pop r7
+push 0u64
+
+# --- digit_loop (instruction 47) ---
+# P is zero exactly when every limb is, and six limbs under 2^32 sum to less
+# than 2^64, so the sum is zero only when all of them are -- no need to test
+# each limb separately.
+push r1
+push r2
+add
+pop r9
+push r9
+push r3
+add
+pop r9
+push r9
+push r4
+add
+pop r9
+push r9
+push r5
+add
+pop r9
+push r9
+push r6
+add
+pop r9
+push r9
+jiz 77p
+call 177p
+# The digit div10 shifted out is in r7.
+pop r8
+push r8
+push r7
+add
+pop r8
+push r8
+jmp 47p
+
+# --- done (instruction 77) ---
+exit
+
+# --- mul_small: P *= r8, least significant limb first ---
+# r7 carries between limbs, r9 holds the double-width product of one limb.
+# --- mul_small (instruction 78) ---
+push 0u64
+pop r7
+
+push r1
+push r8
+mul
+pop r9
+push r9
+push r7
+add
+pop r9
+push r9
+push 4294967296u64
+rem
+pop r1
+push r9
+push 4294967296u64
+div
+pop r7
+
+push r2
+push r8
+mul
+pop r9
+push r9
+push r7
+add
+pop r9
+push r9
+push 4294967296u64
+rem
+pop r2
+push r9
+push 4294967296u64
+div
+pop r7
+
+push r3
+push r8
+mul
+pop r9
+push r9
+push r7
+add
+pop r9
+push r9
+push 4294967296u64
+rem
+pop r3
+push r9
+push 4294967296u64
+div
+pop r7
+
+push r4
+push r8
+mul
+pop r9
+push r9
+push r7
+add
+pop r9
+push r9
+push 4294967296u64
+rem
+pop r4
+push r9
+push 4294967296u64
+div
+pop r7
+
+push r5
+push r8
+mul
+pop r9
+push r9
+push r7
+add
+pop r9
+push r9
+push 4294967296u64
+rem
+pop r5
+push r9
+push 4294967296u64
+div
+pop r7
+
+push r6
+push r8
+mul
+pop r9
+push r9
+push r7
+add
+pop r9
+push r9
+push 4294967296u64
+rem
+pop r6
+push r9
+push 4294967296u64
+div
+pop r7
+
+# The carry left in r7 is the part that did not fit in 192 bits. Dropping it is
+# the wrap.
+ret
+
+# --- div10: P /= 10, most significant limb first, digit left in r7 ---
+# r7 is the running remainder, always under ten, so r7 * 2^32 + limb stays
+# under 2^64 and its quotient by ten stays under 2^32 -- a limb again.
+# --- div10 (instruction 177) ---
+push 0u64
+pop r7
+
+push r7
+push 4294967296u64
+mul
+pop r9
+push r9
+push r6
+add
+pop r9
+push r9
+push 10u64
+div
+pop r6
+push r9
+push 10u64
+rem
+pop r7
+
+push r7
+push 4294967296u64
+mul
+pop r9
+push r9
+push r5
+add
+pop r9
+push r9
+push 10u64
+div
+pop r5
+push r9
+push 10u64
+rem
+pop r7
+
+push r7
+push 4294967296u64
+mul
+pop r9
+push r9
+push r4
+add
+pop r9
+push r9
+push 10u64
+div
+pop r4
+push r9
+push 10u64
+rem
+pop r7
+
+push r7
+push 4294967296u64
+mul
+pop r9
+push r9
+push r3
+add
+pop r9
+push r9
+push 10u64
+div
+pop r3
+push r9
+push 10u64
+rem
+pop r7
+
+push r7
+push 4294967296u64
+mul
+pop r9
+push r9
+push r2
+add
+pop r9
+push r9
+push 10u64
+div
+pop r2
+push r9
+push 10u64
+rem
+pop r7
+
+push r7
+push 4294967296u64
+mul
+pop r9
+push r9
+push r1
+add
+pop r9
+push r9
+push 10u64
+div
+pop r1
+push r9
+push 10u64
+rem
+pop r7
+
+ret
