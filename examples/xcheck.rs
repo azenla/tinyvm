@@ -1,4 +1,13 @@
-//! Temporary: runs a program through all five tiers and compares the results.
+//! Runs one program through every tier the platform supports with the same
+//! inputs and exits nonzero if any result disagrees — a scriptable check of
+//! the invariant that all tiers produce identical results.
+//!
+//! A result is the value popped after the run, compared via `Debug` so tags
+//! count, or the error variant when the run fails. The pc recorded on failure
+//! is not compared: tiers 1–2 index raw ops while tiers 3–5 index the fused
+//! program, so failure pcs only correspond through the source map.
+//!
+//! usage: cargo run --release --example xcheck <program> [inputs...]
 use std::str::FromStr;
 use tinyvm::machine::intermediate::IntermediateProgram;
 use tinyvm::machine::optimizer::{OptimizedProgram, ValueType};

@@ -28,6 +28,7 @@ cargo run --release -- programs/fib.tinyvm 30u64          # run a program (inlin
 cargo run --release --example bench                       # all tiers, fib(2000000) x20
 cargo run --release --example bench programs/ack.tinyvm 5 3u64 6u64
 cargo run --release --example dump programs/fib.tinyvm --code 2000000u64
+cargo run --release --example xcheck programs/ack.tinyvm 3u64 6u64         # tiers agree?
 ```
 
 `cargo test` alone only covers the host architecture's JIT backend. **A JIT change is not
@@ -43,6 +44,12 @@ share of *executed* ops lowered to `helper`, which bounds what the JIT can win.
 `examples/bench` prints M ops/s and runs/s per tier. Between builds, code-layout noise
 moves the per-op figures by a few percent even with identical logic; compare `runs/s` and
 re-run before believing a small regression.
+
+`examples/xcheck` runs one program through every tier with the same inputs (u64/u32 only)
+and exits nonzero if any result — the final popped value, tag included, or the error
+variant — disagrees: the quick way to try a change against the identical-results invariant
+on a real program. It does not compare the failure pc: tiers 1–2 record a raw op index and
+tiers 3–5 a fused one, so pcs only correspond through the source map.
 
 Profiles: `release-debuginfo` (release + symbols, for profiling generated code),
 `dev-fast` (debug without debuginfo, for quick test cycles).
